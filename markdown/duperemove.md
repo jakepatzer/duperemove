@@ -150,6 +150,37 @@ simultaneously on the same hashfile may corrupt that hashfile.
   ~ Read data blocks and skip any zeroed blocks, useful for speedup duperemove,
 but can prevent deduplication of zeroed files.
 
+**\--coalesce**
+  ~ Off by default. When enabled, a duplicate block match is extended
+forward by direct byte comparison of the two files and the entire
+contiguous matching range is submitted to the kernel as a single
+dedupe request, instead of one request per block. This drastically
+reduces the number of `FIDEDUPERANGE` ioctls, the resulting extent-tree
+metadata and the on-disk fragmentation when deduplicating small blocks
+(for example `-b 4096`) against large files such as disk images. The
+extension is forward-only and never crosses either file's end. Because
+`FIDEDUPERANGE` performs its own byte-for-byte verification in the
+kernel before sharing data, this option cannot cause data divergence;
+an over-long range is simply rejected or partially deduped by the
+kernel.
+
+**\--min-dedupe-size**=`size`
+  ~ Only effective together with `--coalesce`. Contiguous matching
+ranges shorter than `size` are not submitted for deduplication at all.
+Accepts a human-readable size (for example `16K`, `128K`, `1M`).
+Default is `0` (no minimum). Useful on rotational disks to avoid
+creating tiny shared extents that yield little or no space saving.
+
+**\--dedupe-target-priority**=`path_prefix`
+  ~ When deduplicating a group of identical extents, the extent whose
+physical data is kept (the target) defaults to the first file in scan
+order. If this option is given and any file in the group has a path
+beginning with `path_prefix`, that file is chosen as the target
+instead, regardless of scan order. This provides a strong guarantee
+about which copy survives (for example, keeping the extents that live
+inside compressed disk images). If no file in the group matches, the
+default behaviour is used.
+
 **-b** `size`
   ~ Use the specified block size for reading file extents. Defaults to 128K.
 

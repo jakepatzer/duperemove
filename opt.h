@@ -15,6 +15,7 @@
 #define	__OPT_H__
 
 #include <stdbool.h>
+#include <stdint.h>
 
 struct options {
 	int run_dedupe;
@@ -28,6 +29,19 @@ struct options {
 	unsigned int batch_size;
 	bool fdupes_mode : 1;
 	char *hashfile;
+
+	/*
+	 * Contiguous range coalescing (off by default; --coalesce).
+	 * When enabled, a seed block match is extended forward by
+	 * direct byte comparison and submitted as a single large
+	 * FIDEDUPERANGE range instead of many per-block ioctls.
+	 */
+	bool coalesce : 1;
+	uint64_t min_dedupe_size;	/* skip coalesced ranges shorter
+					 * than this (0 = no minimum) */
+	char *dedupe_target_priority;	/* path prefix that, if matched,
+					 * forces an extent to be the
+					 * dedupe target */
 };
 
 extern struct options options;

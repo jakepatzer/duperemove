@@ -51,6 +51,247 @@ static volatile unsigned long long curr_dedupe_pass;
 static unsigned int leading_spaces;
 static bool whole_file_dedup;
 
+/*
+ * Contiguous range coalescing support (enabled via --coalesce).
+ *
+ * Safety note: duperemove submits ranges via FIDEDUPERANGE, which
+ * performs its own byte-for-byte comparison inside the kernel before
+ * sharing any data. The extension logic below is therefore only an
+ * optimization hint: an over-long range can never corrupt data, it can
+ * at worst be rejected or partially deduped by the kernel.
+ */
+#define COALESCE_ALIGN		4096ULL		/* btrfs min dedup unit */
+#define COALESCE_CHUNK		(128ULL * 1024)	/* per-pread compare size */
+
+/*
+ * Per-thread extension buffers, allocated once on first use and reused
+ * for the lifetime of the thread (bounded: io_threads * 2 * 128 KiB).
+ */
+static __thread char *coalesce_buf_a;
+static __thread char *coalesce_buf_b;
+
+struct coalesce_key {
+	int64_t	src_id;
+	int64_t	dst_id;
+};
+
+static GHashTable *coalesce_map;
+static GMutex coalesce_map_mutex;
+
+static guint coalesce_key_hash(gconstpointer p)
+{
+	const struct coalesce_key *k = p;
+
+	return g_int64_hash(&k->src_id) ^ g_int64_hash(&k->dst_id);
+}
+
+static gboolean coalesce_key_equal(gconstpointer a, gconstpointer b)
+{
+	const struct coalesce_key *ka = a;
+	const struct coalesce_key *kb = b;
+
+	return ka->src_id == kb->src_id && ka->dst_id == kb->dst_id;
+}
+
+static void coalesce_map_init(void)
+{
+	if (!options.coalesce)
+		return;
+
+	g_mutex_lock(&coalesce_map_mutex);
+	coalesce_map = g_hash_table_new_full(coalesce_key_hash,
+					     coalesce_key_equal,
+					     g_free, g_free);
+	g_mutex_unlock(&coalesce_map_mutex);
+}
+
+static void coalesce_map_destroy(void)
+{
+	g_mutex_lock(&coalesce_map_mutex);
+	if (coalesce_map) {
+		g_hash_table_destroy(coalesce_map);
+		coalesce_map = NULL;
+	}
+	g_mutex_unlock(&coalesce_map_mutex);
+}
+
+/*
+ * True if the destination region at dst_off for the (src_id, dst_id)
+ * file pair was already covered by a previously submitted coalesced
+ * range and should be skipped. Keyed by both file ids so that the same
+ * destination file matched against different source files at different
+ * offsets is tracked independently.
+ */
+static bool coalesce_covered(int64_t src_id, int64_t dst_id,
+			     uint64_t dst_off)
+{
+	struct coalesce_key key = { .src_id = src_id, .dst_id = dst_id };
+	uint64_t *hw;
+	bool covered = false;
+
+	if (!coalesce_map)
+		return false;
+
+	g_mutex_lock(&coalesce_map_mutex);
+	hw = g_hash_table_lookup(coalesce_map, &key);
+	if (hw && dst_off < *hw)
+		covered = true;
+	g_mutex_unlock(&coalesce_map_mutex);
+
+	return covered;
+}
+
+/*
+ * Record that the (src_id, dst_id) pair has been deduped in the
+ * destination up to dst_end. The maximum is kept so that out-of-order
+ * entries cannot lower the high-water mark.
+ */
+static void coalesce_record(int64_t src_id, int64_t dst_id,
+			    uint64_t dst_end)
+{
+	struct coalesce_key lookup = { .src_id = src_id, .dst_id = dst_id };
+	struct coalesce_key *key;
+	uint64_t *hw;
+
+	if (!coalesce_map)
+		return;
+
+	g_mutex_lock(&coalesce_map_mutex);
+	hw = g_hash_table_lookup(coalesce_map, &lookup);
+	if (hw) {
+		if (dst_end > *hw)
+			*hw = dst_end;
+	} else {
+		key = g_malloc(sizeof(*key));
+		*key = lookup;
+		hw = g_malloc(sizeof(*hw));
+		*hw = dst_end;
+		g_hash_table_insert(coalesce_map, key, hw);
+	}
+	g_mutex_unlock(&coalesce_map_mutex);
+}
+
+static int coalesce_get_bufs(char **a, char **b)
+{
+	if (coalesce_buf_a == NULL) {
+		coalesce_buf_a = malloc(COALESCE_CHUNK);
+		coalesce_buf_b = malloc(COALESCE_CHUNK);
+		if (coalesce_buf_a == NULL || coalesce_buf_b == NULL) {
+			free(coalesce_buf_a);
+			free(coalesce_buf_b);
+			coalesce_buf_a = coalesce_buf_b = NULL;
+			return -ENOMEM;
+		}
+	}
+	*a = coalesce_buf_a;
+	*b = coalesce_buf_b;
+	return 0;
+}
+
+/*
+ * Starting from a seed match of seed_len bytes at (tgt, tgt_off) and
+ * (dst, dst_off), extend the match forward by direct byte comparison.
+ * Returns the total contiguous match length, aligned down to the btrfs
+ * dedup unit and never below seed_len. Reads only; never aborts. On any
+ * pread error or short read the extension stops at the confirmed point
+ * and whatever has been verified so far is returned.
+ */
+static uint64_t extend_match(struct filerec *tgt, uint64_t tgt_off,
+			     struct filerec *dst, uint64_t dst_off,
+			     uint64_t seed_len)
+{
+	char *buf_a, *buf_b;
+	uint64_t len = seed_len;
+	uint64_t tgt_max, dst_max, ceiling;
+
+	if (coalesce_get_bufs(&buf_a, &buf_b)) {
+		eprintf("Warning: out of memory for coalesce buffers; "
+			"submitting seed length only.\n");
+		return seed_len;
+	}
+
+	/*
+	 * Never read or submit past either file's scanned size. The
+	 * kernel re-verifies regardless, but staying in bounds avoids
+	 * pointless short reads and EINVAL.
+	 */
+	if (tgt_off >= tgt->size || dst_off >= dst->size)
+		return seed_len;
+
+	tgt_max = tgt->size - tgt_off;
+	dst_max = dst->size - dst_off;
+	ceiling = tgt_max < dst_max ? tgt_max : dst_max;
+
+	while (len < ceiling) {
+		uint64_t want = ceiling - len;
+		ssize_t ra, rb, cmp;
+
+		if (want > COALESCE_CHUNK)
+			want = COALESCE_CHUNK;
+
+		ra = pread(tgt->fd, buf_a, want, tgt_off + len);
+		if (ra <= 0) {
+			if (ra < 0)
+				vprintf("coalesce: pread(\"%s\", %"PRIu64
+					") failed: %s; stopping extension\n",
+					tgt->filename, tgt_off + len,
+					strerror(errno));
+			break;
+		}
+
+		rb = pread(dst->fd, buf_b, ra, dst_off + len);
+		if (rb <= 0) {
+			if (rb < 0)
+				vprintf("coalesce: pread(\"%s\", %"PRIu64
+					") failed: %s; stopping extension\n",
+					dst->filename, dst_off + len,
+					strerror(errno));
+			break;
+		}
+
+		cmp = ra < rb ? ra : rb;
+		if (memcmp(buf_a, buf_b, cmp) != 0) {
+			ssize_t i = 0;
+
+			while (i < cmp && buf_a[i] == buf_b[i])
+				i++;
+			len += i;
+			break;
+		}
+
+		len += cmp;
+		if (cmp < (ssize_t)want)
+			break;	/* short read - treat as EOF */
+	}
+
+	/* Align down to the btrfs dedup unit; never below seed_len. */
+	len &= ~(COALESCE_ALIGN - 1);
+	if (len < seed_len)
+		len = seed_len;
+	return len;
+}
+
+/*
+ * If --dedupe-target-priority is set, return the first extent in the
+ * group whose file path begins with the configured prefix, else NULL.
+ */
+static struct extent *find_priority_target(struct dupe_extents *dext)
+{
+	struct extent *extent;
+	size_t plen;
+
+	if (options.dedupe_target_priority == NULL)
+		return NULL;
+
+	plen = strlen(options.dedupe_target_priority);
+	list_for_each_entry(extent, &dext->de_extents, e_list) {
+		if (strncmp(extent->e_file->filename,
+			    options.dedupe_target_priority, plen) == 0)
+			return extent;
+	}
+	return NULL;
+}
+
 void print_dupes_table(struct results_tree *res, bool whole_file)
 {
 	struct rb_root *root = &res->root;
@@ -108,6 +349,21 @@ static void process_dedupe_results(struct dedupe_ctxt *ctxt,
 			*kern_bytes += target_bytes;
 
 		/*
+		 * Coalesce: on a successful dedupe of a destination,
+		 * advance the (source, destination) high-water mark so
+		 * subsequent per-block entries that fall inside this
+		 * range are skipped instead of generating redundant
+		 * ioctls. Only real, kernel-confirmed bytes are
+		 * recorded, so a SAME_DATA_DIFFERS / partial result
+		 * does not over-claim coverage.
+		 */
+		if (options.coalesce && target_status == 0 &&
+		    f != ctxt->ioctl_file && target_bytes)
+			coalesce_record(ctxt->ioctl_file->fileid,
+					f->fileid,
+					target_loff + target_bytes);
+
+		/*
 		 * Only print in case of error.
 		 *
 		 * Kernels older than 4.2 can't handle the target and
@@ -124,9 +380,10 @@ static void process_dedupe_results(struct dedupe_ctxt *ctxt,
 		else if (target_status < 0)
 			status_str = strerror(-target_status);
 		printf("[%p] Dedupe for file \"%s\" had status (%d) "
-		       "\"%s\".\n",
+		       "\"%s\" at offset %s, %s bytes.\n",
 		       g_thread_self(), f->filename, target_status,
-		       status_str);
+		       status_str, pretty_size(target_loff),
+		       pretty_size(target_bytes));
 	}
 }
 
@@ -317,6 +574,98 @@ static int dedupe_extent_list(struct dupe_extents *dext, uint64_t *fiemap_bytes,
 	 */
 	add_shared_extents(dext, &shared_prev);
 
+	/*
+	 * --dedupe-target-priority: if any extent's file path matches
+	 * the configured prefix, move it to the head of the list so
+	 * the loop below selects it as the dedupe target (the extent
+	 * whose physical data survives). This is a stronger guarantee
+	 * than relying on scan/argument order. When the option is
+	 * unset this is a no-op and ordering is unchanged.
+	 */
+	if (options.dedupe_target_priority) {
+		struct extent *prio = find_priority_target(dext);
+
+		if (prio && dext->de_extents.next != &prio->e_list) {
+			list_move(&prio->e_list, &dext->de_extents);
+			vprintf("[%p] coalesce: target priority selected "
+				"\"%s\"\n", g_thread_self(),
+				prio->e_file->filename);
+		}
+	}
+
+	/*
+	 * Contiguous range coalescing pre-pass. This is side-effect
+	 * free: it only opens files read-only and compares bytes. It
+	 * computes the largest contiguous match length that is common
+	 * to *every* (target, destination) pair in the group (the
+	 * minimum across pairs), so a single FIDEDUPERANGE of that
+	 * length replaces many per-block ioctls. Destinations already
+	 * covered by an earlier coalesced range are excluded here (and
+	 * skipped again in the loop below).
+	 */
+	if (options.coalesce && !list_empty(&dext->de_extents)) {
+		OPEN_ONCE(cfiles);
+		struct extent *tgt = list_first_entry(&dext->de_extents,
+						      struct extent, e_list);
+		uint64_t min_len = 0;
+		unsigned int n_dests = 0, n_covered = 0, n_measured = 0;
+
+		if (filerec_open_once(tgt->e_file, &cfiles) == 0) {
+			list_for_each_entry(extent, &dext->de_extents,
+					    e_list) {
+				uint64_t l;
+
+				if (extent == tgt)
+					continue;
+				n_dests++;
+				if (coalesce_covered(tgt->e_file->fileid,
+						extent->e_file->fileid,
+						extent->e_loff)) {
+					n_covered++;
+					continue;
+				}
+				if (filerec_open_once(extent->e_file,
+						      &cfiles))
+					continue;
+				l = extend_match(tgt->e_file, tgt->e_loff,
+						 extent->e_file,
+						 extent->e_loff,
+						 dext->de_len);
+				if (n_measured == 0 || l < min_len)
+					min_len = l;
+				n_measured++;
+			}
+		}
+		filerec_close_open_list(&cfiles);
+
+		/*
+		 * Only skip the group when it is genuinely redundant
+		 * (every destination already covered by an earlier
+		 * coalesced range) or when the common range is below
+		 * --min-dedupe-size. In every other situation (target
+		 * or a destination not openable in this read-only
+		 * pre-pass, nothing measured) fall back to the
+		 * unmodified per-group length so that enabling
+		 * --coalesce is never worse than not enabling it.
+		 */
+		if (n_dests > 0 && n_covered == n_dests) {
+			qprintf("[%p] coalesce: extents already covered, "
+				"skipping.\n", g_thread_self());
+			return DEDUPE_EXTENTS_CLEANED;
+		}
+		if (n_measured > 0) {
+			if (options.min_dedupe_size &&
+			    min_len < options.min_dedupe_size) {
+				vprintf("[%p] coalesce: range %"PRIu64" < "
+					"min-dedupe-size %"PRIu64
+					", skipping.\n", g_thread_self(),
+					min_len, options.min_dedupe_size);
+				return DEDUPE_EXTENTS_CLEANED;
+			}
+			len = min_len;
+		}
+	}
+
 	list_for_each_entry(extent, &dext->de_extents, e_list) {
 		if (list_is_last(&extent->e_list, &dext->de_extents))
 			last = 1;
@@ -348,6 +697,26 @@ static int dedupe_extent_list(struct dupe_extents *dext, uint64_t *fiemap_bytes,
 		vprintf("[%p] Add extent for file \"%s\" at offset %s (%d)\n",
 			g_thread_self(), extent->e_file->filename,
 			pretty_size(extent->e_loff), extent->e_file->fd);
+
+		/*
+		 * Coalesce: skip destinations already covered by a
+		 * previously submitted larger range for this exact
+		 * (target, destination) file pair. The target extent
+		 * itself is never a destination, so it is exempt.
+		 */
+		if (options.coalesce && tgt_extent &&
+		    extent != tgt_extent &&
+		    coalesce_covered(tgt_extent->e_file->fileid,
+				     extent->e_file->fileid,
+				     extent->e_loff)) {
+			vprintf("[%p] coalesce: skipping covered extent "
+				"\"%s\" @ %s\n", g_thread_self(),
+				extent->e_file->filename,
+				pretty_size(extent->e_loff));
+			if (ctxt && last)
+				goto run_dedupe;
+			continue;
+		}
 
 		if (ctxt == NULL) {
 			if (tgt_extent == NULL) {
@@ -617,6 +986,9 @@ void dedupe_results(struct results_tree *res, bool whole_file)
 
 	total_dedupe_passes = res->num_dupes;
 	leading_spaces = num_digits(total_dedupe_passes);
+
+	coalesce_map_init();
+
 	ret = push_extents(res);
 	if (ret) {
 		eprintf("Fatal error while deduping: %s\n", err->message);
@@ -624,6 +996,8 @@ void dedupe_results(struct results_tree *res, bool whole_file)
 	}
 
 	g_thread_pool_free(dedupe_pool, FALSE, TRUE);
+
+	coalesce_map_destroy();
 
 	if (ret == 0) {
 		vprintf("Kernel processed data (excludes target files): "

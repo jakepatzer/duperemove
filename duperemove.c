@@ -204,6 +204,9 @@ enum {
 	QUIET_OPTION,
 	EXCLUDE_OPTION,
 	BATCH_SIZE_OPTION,
+	COALESCE_OPTION,
+	MIN_DEDUPE_SIZE_OPTION,
+	DEDUPE_TARGET_PRIORITY_OPTION,
 };
 
 static int process_fdupes(void)
@@ -316,6 +319,10 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "quiet", 0, NULL, QUIET_OPTION },
 		{ "exclude", 1, NULL, EXCLUDE_OPTION },
 		{ "batchsize", 1, NULL, BATCH_SIZE_OPTION },
+		{ "coalesce", 0, NULL, COALESCE_OPTION },
+		{ "min-dedupe-size", 1, NULL, MIN_DEDUPE_SIZE_OPTION },
+		{ "dedupe-target-priority", 1, NULL,
+		  DEDUPE_TARGET_PRIORITY_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -411,6 +418,20 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		case 'B':
 			options.batch_size = parse_size(optarg);
 			break;
+		case COALESCE_OPTION:
+			options.coalesce = true;
+			break;
+		case MIN_DEDUPE_SIZE_OPTION:
+			options.min_dedupe_size = parse_size(optarg);
+			break;
+		case DEDUPE_TARGET_PRIORITY_OPTION:
+			options.dedupe_target_priority = strdup(optarg);
+			if (options.dedupe_target_priority == NULL) {
+				eprintf("Error: out of memory parsing "
+					"--dedupe-target-priority\n");
+				return ENOMEM;
+			}
+			break;
 		case HELP_OPTION:
 			help();
 			break;
@@ -427,6 +448,10 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			"options have no meaning\n");
 		return 1;
 	}
+
+	if (options.min_dedupe_size && !options.coalesce)
+		eprintf("Warning: --min-dedupe-size has no effect without "
+			"--coalesce; ignoring.\n");
 
 	/* Filter out option combinations that don't make sense. */
 	if ((write_hashes + read_hashes + update_hashes) > 1) {
