@@ -42,6 +42,15 @@ struct options {
 	char *dedupe_target_priority;	/* path prefix that, if matched,
 					 * forces an extent to be the
 					 * dedupe target */
+
+	/*
+	 * Streaming lookup mode (--lookup-only). The hashfile is
+	 * treated as a read-only reference dictionary; files already
+	 * present in the hashfile are skipped, files not present are
+	 * stream-hashed block-by-block and each digest is looked up
+	 * against the hashfile in memory. No writes to the hashfile.
+	 */
+	bool lookup_only : 1;
 };
 
 extern struct options options;

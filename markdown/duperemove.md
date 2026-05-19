@@ -181,6 +181,25 @@ about which copy survives (for example, keeping the extents that live
 inside compressed disk images). If no file in the group matches, the
 default behaviour is used.
 
+**\--lookup-only**
+  ~ Treat the hashfile as a strictly read-only reference dictionary
+and stream-process files that are not in it. The hash + find-dupes +
+batch dedupe pipeline is bypassed entirely: for each command-line
+file, if it is already present in the hashfile it is opened as a
+reference; otherwise it is read block by block, each block hash is
+looked up against the hashfile, and any match is fed directly into
+the coalesce extension and per-pair dedupe submission. No writes are
+issued to the hashfile (the database is opened with SQLITE_OPEN_READONLY,
+so the guarantee is enforced by the database layer, not by code review).
+Memory usage is bounded by one in-flight file plus the open reference
+files; the hashfile does not grow regardless of how many lookup files
+are processed. Requires `--hashfile`. Incompatible with `--fdupes`,
+`-L`, and `-R`. `--batchsize` has no effect in this mode and is
+ignored with a warning. The block size given by `-b` must match the
+block size stored in the hashfile (the run aborts otherwise). Combine
+with `--coalesce` for large-range dedupes and with `--skip-zeroes`
+to skip zero blocks during streaming.
+
 **-b** `size`
   ~ Use the specified block size for reading file extents. Defaults to 128K.
 

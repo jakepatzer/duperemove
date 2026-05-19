@@ -93,7 +93,7 @@ static gboolean coalesce_key_equal(gconstpointer a, gconstpointer b)
 	return ka->src_id == kb->src_id && ka->dst_id == kb->dst_id;
 }
 
-static void coalesce_map_init(void)
+void coalesce_map_init(void)
 {
 	if (!options.coalesce)
 		return;
@@ -105,7 +105,7 @@ static void coalesce_map_init(void)
 	g_mutex_unlock(&coalesce_map_mutex);
 }
 
-static void coalesce_map_destroy(void)
+void coalesce_map_destroy(void)
 {
 	g_mutex_lock(&coalesce_map_mutex);
 	if (coalesce_map) {
@@ -122,8 +122,8 @@ static void coalesce_map_destroy(void)
  * destination file matched against different source files at different
  * offsets is tracked independently.
  */
-static bool coalesce_covered(int64_t src_id, int64_t dst_id,
-			     uint64_t dst_off)
+bool coalesce_covered(int64_t src_id, int64_t dst_id,
+		      uint64_t dst_off)
 {
 	struct coalesce_key key = { .src_id = src_id, .dst_id = dst_id };
 	uint64_t *hw;
@@ -146,8 +146,8 @@ static bool coalesce_covered(int64_t src_id, int64_t dst_id,
  * destination up to dst_end. The maximum is kept so that out-of-order
  * entries cannot lower the high-water mark.
  */
-static void coalesce_record(int64_t src_id, int64_t dst_id,
-			    uint64_t dst_end)
+void coalesce_record(int64_t src_id, int64_t dst_id,
+		     uint64_t dst_end)
 {
 	struct coalesce_key lookup = { .src_id = src_id, .dst_id = dst_id };
 	struct coalesce_key *key;
@@ -196,9 +196,9 @@ static int coalesce_get_bufs(char **a, char **b)
  * pread error or short read the extension stops at the confirmed point
  * and whatever has been verified so far is returned.
  */
-static uint64_t extend_match(struct filerec *tgt, uint64_t tgt_off,
-			     struct filerec *dst, uint64_t dst_off,
-			     uint64_t seed_len)
+uint64_t extend_match(struct filerec *tgt, uint64_t tgt_off,
+		      struct filerec *dst, uint64_t dst_off,
+		      uint64_t seed_len)
 {
 	char *buf_a, *buf_b;
 	uint64_t len = seed_len;
@@ -333,8 +333,8 @@ void print_dupes_table(struct results_tree *res, bool whole_file)
 	}
 }
 
-static void process_dedupe_results(struct dedupe_ctxt *ctxt,
-				   uint64_t *kern_bytes)
+void process_dedupe_results(struct dedupe_ctxt *ctxt,
+			    uint64_t *kern_bytes)
 {
 	int done = 0;
 	int target_status;

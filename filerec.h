@@ -49,6 +49,7 @@ void free_all_filerecs(void);
 
 struct filerec *filerec_new(const char *filename, int64_t fileid,
 			    uint64_t size);
+void filerec_free(struct filerec *file);
 struct filerec *filerec_find(int64_t fileid);
 
 int filerec_open(struct filerec *file, bool quiet);

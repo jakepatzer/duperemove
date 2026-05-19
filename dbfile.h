@@ -69,6 +69,12 @@ struct file {
 };
 
 struct dbhandle *dbfile_open_handle(char *filename);
+/*
+ * Open an existing hashfile strictly read-only for --lookup-only.
+ * No CREATE/UPDATE/INSERT is issued at any point; the SQLite layer
+ * enforces this via SQLITE_OPEN_READONLY.
+ */
+struct dbhandle *dbfile_open_handle_readonly(char *filename);
 void dbfile_close_handle(struct dbhandle *db);
 
 /*

@@ -201,7 +201,7 @@ struct filerec *filerec_new(const char *filename, int64_t fileid,
 	return file;
 }
 
-static void filerec_free(struct filerec *file)
+void filerec_free(struct filerec *file)
 {
 	if (file) {
 		free(file->filename);

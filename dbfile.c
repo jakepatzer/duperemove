@@ -542,6 +542,148 @@ err:
 	return NULL;
 }
 
+/*
+ * Return 0 if an index with the given name exists in the database,
+ * ENOENT if not, or an sqlite error code on failure.
+ */
+static int dbfile_check_index(sqlite3 *db, const char *name)
+{
+	_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *stmt = NULL;
+	int ret;
+
+	ret = sqlite3_prepare_v2(db,
+		"select 1 from sqlite_master where type='index' and name=?1;",
+		-1, &stmt, NULL);
+	if (ret) {
+		perror_sqlite(ret, "preparing index-check statement");
+		return ret;
+	}
+
+	ret = sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC);
+	if (ret) {
+		perror_sqlite(ret, "binding index-check name");
+		return ret;
+	}
+
+	ret = sqlite3_step(stmt);
+	if (ret == SQLITE_ROW)
+		return 0;
+	if (ret == SQLITE_DONE)
+		return ENOENT;
+
+	perror_sqlite(ret, "stepping index-check statement");
+	return ret;
+}
+
+/*
+ * Open an existing hashfile strictly read-only for streaming
+ * --lookup-only mode. Unlike dbfile_open_handle() this path performs
+ * NO writes: no CREATE TABLE / CREATE INDEX, no chmod, no PRAGMA
+ * journal_mode change, no sync_config. It also prepares only the
+ * SELECT statements lookup mode needs (select_file_changes and
+ * load_filerec). All write-side prepared statement slots remain NULL,
+ * which dbfile_close_handle() handles safely.
+ *
+ * The database layer enforces the read-only guarantee: any accidental
+ * INSERT / UPDATE / DELETE would fail at sqlite3_step() with
+ * SQLITE_READONLY, not silently mutate the hashfile.
+ */
+struct dbhandle *dbfile_open_handle_readonly(char *filename)
+{
+	struct dbhandle *result;
+	struct dbfile_config cfg;
+	int ret;
+
+	if (filename == NULL)
+		return NULL;
+
+	result = calloc(1, sizeof(struct dbhandle));
+	if (result == NULL)
+		return NULL;
+
+	ret = sqlite3_open_v2(filename, &result->db,
+			      SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX |
+			      SQLITE_OPEN_URI, NULL);
+	if (ret) {
+		perror_sqlite_open(result->db, filename);
+		sqlite3_close(result->db);
+		free(result);
+		return NULL;
+	}
+
+	/*
+	 * Only set read-only-safe pragmas. PRAGMA journal_mode = WAL
+	 * and PRAGMA synchronous would attempt to mutate the database
+	 * file and are deliberately skipped.
+	 */
+	ret = sqlite3_exec(result->db, "PRAGMA cache_size = -256000",
+			   NULL, NULL, NULL);
+	if (ret) {
+		perror_sqlite(ret, "configuring database (cache size)");
+		goto err;
+	}
+
+	ret = dbfile_get_config(result->db, &cfg);
+	if (ret) {
+		perror_sqlite(ret, "reading hashfile config");
+		goto err;
+	}
+
+	if (cfg.major != DB_FILE_MAJOR || cfg.minor != DB_FILE_MINOR) {
+		eprintf("Hashfile version mismatch (mine: %d.%d, file: %d.%d)\n",
+			DB_FILE_MAJOR, DB_FILE_MINOR, cfg.major, cfg.minor);
+		goto err;
+	}
+
+	if (strncasecmp(cfg.hash_type, HASH_TYPE, 8)) {
+		eprintf("Hashfile uses hash \"%.*s\" but this build uses "
+			"\"%.*s\".\n", 8, cfg.hash_type, 8, HASH_TYPE);
+		goto err;
+	}
+
+	/*
+	 * --lookup-only requires the digest index on the blocks table.
+	 * Without it every block lookup would be a full-table scan;
+	 * the hashfile would have to be billions of rows to be useful
+	 * here. Refuse rather than silently performing pathologically.
+	 */
+	ret = dbfile_check_index(result->db, "idx_blocks_digest");
+	if (ret == ENOENT) {
+		eprintf("Hashfile is missing index 'idx_blocks_digest'. "
+			"Rebuild it with a current duperemove "
+			"(hash phase always creates this index).\n");
+		goto err;
+	}
+	if (ret) {
+		eprintf("Error checking hashfile indexes.\n");
+		goto err;
+	}
+
+	/* Prepare only the SELECT statements lookup mode needs. */
+	ret = sqlite3_prepare_v2(result->db,
+		"select mtime, size, filename, id from files "
+		"where ino = ?1 and subvol = ?2;",
+		-1, &(result->stmts.select_file_changes), NULL);
+	if (ret) {
+		perror_sqlite(ret, "preparing select_file_changes");
+		goto err;
+	}
+
+	ret = sqlite3_prepare_v2(result->db,
+		"select filename, size from files where id = ?1;",
+		-1, &(result->stmts.load_filerec), NULL);
+	if (ret) {
+		perror_sqlite(ret, "preparing load_filerec");
+		goto err;
+	}
+
+	return result;
+
+err:
+	dbfile_close_handle(result);
+	return NULL;
+}
+
 void dbfile_close_handle(struct dbhandle *db)
 {
 	if(db) {
