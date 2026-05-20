@@ -200,6 +200,19 @@ block size stored in the hashfile (the run aborts otherwise). Combine
 with `--coalesce` for large-range dedupes and with `--skip-zeroes`
 to skip zero blocks during streaming.
 
+    `Important:` lookup matches at block granularity and therefore
+requires the hashfile to contain per-block hashes (the `blocks`
+table). The default hash phase only populates the `extents` table.
+Build the reference hashfile with `--dedupe-options=partial` so that
+per-block hashes are written, for example:
+
+        duperemove -rh --hashfile=<hashfile> --dedupe-options=partial \\
+            -b 4096 /path/to/images/
+
+    `--lookup-only` will abort with a clear error if it opens a
+hashfile that has no block hashes, rather than silently finding zero
+matches.
+
 **-b** `size`
   ~ Use the specified block size for reading file extents. Defaults to 128K.
 

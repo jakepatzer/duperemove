@@ -659,6 +659,49 @@ struct dbhandle *dbfile_open_handle_readonly(char *filename)
 		goto err;
 	}
 
+	/*
+	 * --lookup-only matches per-block, against the 'blocks' table.
+	 * The default hash phase only populates the 'extents' table
+	 * (one hash per physical extent); per-block hashes are only
+	 * written when --dedupe-options=partial is used. An extent
+	 * hash would also be unusable here in practice, because the
+	 * extent boundaries of an extracted file have no reason to
+	 * align with extent boundaries inside its source image -- so
+	 * extent-based lookups would yield essentially zero matches.
+	 * Detect the misconfiguration up front and fail with a clear,
+	 * actionable error rather than silently dedupe nothing.
+	 */
+	{
+		_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *bstmt = NULL;
+		int step;
+
+		ret = sqlite3_prepare_v2(result->db,
+			"select 1 from blocks limit 1;",
+			-1, &bstmt, NULL);
+		if (ret) {
+			perror_sqlite(ret, "preparing blocks-population check");
+			goto err;
+		}
+		step = sqlite3_step(bstmt);
+		if (step == SQLITE_DONE) {
+			eprintf("Error: hashfile contains no per-block "
+				"hashes. --lookup-only matches at block "
+				"granularity and requires the hashfile to "
+				"have been built with "
+				"--dedupe-options=partial. Rebuild the "
+				"hashfile, for example:\n"
+				"  duperemove -rh --hashfile=<hashfile> "
+				"--dedupe-options=partial -b %u <images>\n",
+				blocksize);
+			goto err;
+		}
+		if (step != SQLITE_ROW) {
+			perror_sqlite(step,
+				      "stepping blocks-population check");
+			goto err;
+		}
+	}
+
 	/* Prepare only the SELECT statements lookup mode needs. */
 	ret = sqlite3_prepare_v2(result->db,
 		"select mtime, size, filename, id from files "

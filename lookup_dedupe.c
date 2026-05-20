@@ -61,6 +61,8 @@ struct lookup_state {
 	uint64_t	seed_matches_found;	/* db rows matched, before
 						 * any dedupe attempt */
 	uint64_t	dedupe_attempts;
+	uint64_t	n_too_small_skipped;	/* files skipped because
+						 * size < min_dedupe_size */
 };
 
 static bool block_is_zero(const char *buf, size_t len)
@@ -137,6 +139,22 @@ static int process_lookup_file(const char *path, int fd, uint64_t size,
 	uint64_t off = 0;
 	int rc = 0;
 	int64_t synth_id;
+
+	/*
+	 * Optimization: a contiguous match in this file can never
+	 * exceed the file's own size, so any file smaller than
+	 * --min-dedupe-size cannot produce a qualifying submission.
+	 * Skip it before any pread / hashing / sqlite work. Default
+	 * --min-dedupe-size of 0 disables this filter.
+	 */
+	if (options.min_dedupe_size && size < options.min_dedupe_size) {
+		vprintf("lookup: skipping \"%s\" (%s < "
+			"--min-dedupe-size); no possible qualifying "
+			"match.\n", path, pretty_size(size));
+		close(fd);
+		st->n_too_small_skipped++;
+		return 0;
+	}
 
 	/*
 	 * Synthetic, in-memory-only fileid. Negative so it can never
@@ -541,13 +559,15 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	coalesce_map_destroy();
 
 	qprintf("lookup: %"PRIu64" lookup file(s) processed, "
+		"%"PRIu64" skipped (< --min-dedupe-size), "
 		"%"PRIu64" reference file(s) pinned, "
 		"%"PRIu64" seed hash match(es), "
 		"%"PRIu64" dedupe attempt(s), "
 		"%"PRIu64" succeeded, %s deduped.\n",
-		st.n_lookup_files, st.n_ref_files,
-		st.seed_matches_found, st.dedupe_attempts,
-		st.matches_deduped, pretty_size(st.bytes_deduped));
+		st.n_lookup_files, st.n_too_small_skipped,
+		st.n_ref_files, st.seed_matches_found,
+		st.dedupe_attempts, st.matches_deduped,
+		pretty_size(st.bytes_deduped));
 
 	if (st.n_lookup_files > 0 && st.matches_deduped == 0) {
 		if (st.seed_matches_found == 0)
