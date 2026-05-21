@@ -51,6 +51,17 @@ struct options {
 	 * against the hashfile in memory. No writes to the hashfile.
 	 */
 	bool lookup_only : 1;
+
+	/*
+	 * --lookup-self: requires --lookup-only. Causes files that
+	 * are already in the hashfile (the "reference" set) to also
+	 * be stream-processed, enabling within-image and cross-image
+	 * dedupe of the reference corpus itself. Self-identity
+	 * matches (a block matching its own row in the hashfile) are
+	 * filtered out; legitimate same-fileid-different-loff matches
+	 * are kept.
+	 */
+	bool lookup_self : 1;
 };
 
 extern struct options options;

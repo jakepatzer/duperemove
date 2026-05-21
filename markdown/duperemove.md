@@ -213,6 +213,48 @@ per-block hashes are written, for example:
 hashfile that has no block hashes, rather than silently finding zero
 matches.
 
+**\--lookup-self**
+  ~ Requires `--lookup-only`. By default `--lookup-only` skips any
+file that is already present in the hashfile (the "reference" set)
+— it pins those files open so their bytes are available for
+extension reads and ioctl submissions, but it does not run them
+through the lookup pipeline. With `--lookup-self`, reference files
+are *also* stream-processed against the hashfile, which enables
+within-file and cross-file dedupe of the reference corpus itself
+(e.g. cross-image and within-image dedupe of disk images that were
+hashed in an earlier `--write-hashes` or `--hashfile` pass).
+
+    The lookup pipeline filters out self-identity rows (a block
+matching its own row in the hashfile, i.e. same fileid AND same
+logical offset). Same-fileid matches at a *different* offset are
+kept and treated as legitimate within-file dedupe candidates.
+
+    When source and destination are the same file, the coalesce
+extension is automatically capped to the gap between the two
+offsets so the submitted ranges do not overlap (the kernel returns
+EINVAL on overlapping `FIDEDUPERANGE` ranges).
+
+    Notes:
+
+    - The hashfile remains opened `SQLITE_OPEN_READONLY`. No new
+      write paths are introduced.
+
+    - When two reference files match each other, the file scanned
+      *first* in the original `--write-hashes` / `--hashfile` pass
+      wins (its extent survives, the later file references it). The
+      order is the SQLite row order of the `idx_blocks_digest` index
+      and is stable across re-runs against the same hashfile.
+
+    - `--dedupe-target-priority` is not honored in `--lookup-self`;
+      control which file wins by controlling Phase 1 scan order.
+
+    - After a cross-file dedupe of A against B, processing B may
+      attempt the reverse dedupe of B against A. The kernel
+      recognises the extents are already shared and returns success
+      without doing additional work; the per-call cost is one extra
+      ioctl. `bytes deduped` in the summary may therefore be larger
+      than the actual on-disk space recovered.
+
 **-b** `size`
   ~ Use the specified block size for reading file extents. Defaults to 128K.
 

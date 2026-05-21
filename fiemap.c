@@ -46,21 +46,43 @@ static unsigned int fiemap_count_extents(int fd)
 struct fiemap_extent *get_extent(struct fiemap *fiemap, size_t loff,
 				 unsigned int *index)
 {
+	/*
+	 * Binary search. fiemap->fm_extents is sorted by fe_logical
+	 * (FIEMAP_EXTENT_LAST is the only out-of-order possibility,
+	 * and it is also the highest fe_logical). Return the
+	 * lowest-indexed extent whose end offset (fe_logical +
+	 * fe_length - 1) is >= loff, matching the original linear-
+	 * scan semantics in O(log N) instead of O(N) per call.
+	 *
+	 * This is the hot path of file_scan.c's csum_whole_file:
+	 * process_blocks calls it once per 4 KiB block via
+	 * is_block_ignored, and process_extents calls it again per
+	 * extent boundary. On a 232 GB BTRFS-compressed file with
+	 * ~1.9 M extents the linear version was ~10^14 compares
+	 * per file (~30 hours on a single core); the binary search
+	 * brings that to ~10^9 compares (a few seconds).
+	 */
+	unsigned int lo = 0;
+	unsigned int hi = fiemap->fm_mapped_extents;
 	struct fiemap_extent *extent;
-	size_t ext_end_off;
 
-	for (unsigned int i = 0; i < fiemap->fm_mapped_extents; i++) {
-		extent = &fiemap->fm_extents[i];
-		ext_end_off = extent->fe_logical + extent->fe_length - 1;
-		if (ext_end_off < loff)
-			continue;
+	while (lo < hi) {
+		unsigned int mid = lo + (hi - lo) / 2;
 
-		if (index)
-			*index = i;
-
-		return extent;
+		extent = &fiemap->fm_extents[mid];
+		if (extent->fe_logical + extent->fe_length - 1 < loff)
+			lo = mid + 1;
+		else
+			hi = mid;
 	}
-	return NULL;
+
+	if (lo >= fiemap->fm_mapped_extents)
+		return NULL;
+
+	if (index)
+		*index = lo;
+
+	return &fiemap->fm_extents[lo];
 }
 
 struct fiemap *do_fiemap(int fd)

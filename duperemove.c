@@ -209,6 +209,7 @@ enum {
 	MIN_DEDUPE_SIZE_OPTION,
 	DEDUPE_TARGET_PRIORITY_OPTION,
 	LOOKUP_ONLY_OPTION,
+	LOOKUP_SELF_OPTION,
 };
 
 static int process_fdupes(void)
@@ -326,6 +327,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "dedupe-target-priority", 1, NULL,
 		  DEDUPE_TARGET_PRIORITY_OPTION },
 		{ "lookup-only", 0, NULL, LOOKUP_ONLY_OPTION },
+		{ "lookup-self", 0, NULL, LOOKUP_SELF_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -438,6 +440,9 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		case LOOKUP_ONLY_OPTION:
 			options.lookup_only = true;
 			break;
+		case LOOKUP_SELF_OPTION:
+			options.lookup_self = true;
+			break;
 		case HELP_OPTION:
 			help();
 			break;
@@ -478,6 +483,11 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			eprintf("Warning: --batchsize has no meaning in "
 				"--lookup-only mode (no batching); "
 				"ignoring.\n");
+	}
+
+	if (options.lookup_self && !options.lookup_only) {
+		eprintf("Error: --lookup-self requires --lookup-only.\n");
+		return EINVAL;
 	}
 
 	/* Filter out option combinations that don't make sense. */
