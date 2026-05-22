@@ -999,16 +999,23 @@ static inline bool is_inlined(struct scan_ctxt *ctxt)
 }
 
 /*
- * Comparator for sorting the per-file block_csum array by digest
- * before bulk-inserting into the blocks table. Sorting turns the
- * random-XXH128 insert pattern into a sequential one for the
- * idx_blocks_digest B-tree, which is the dominant cost at scale.
- * See dbfile_store_block_hashes call site below for the rationale.
+ * Comparators for sorting the per-file hash arrays by digest before
+ * bulk-inserting. Sorting turns the random-XXH128 insert pattern
+ * into a sequential one for the digest index (idx_blocks_digest /
+ * idx_extents_digest_len), which is the dominant cost at scale. See
+ * the dbfile_store_*_hashes call sites below for the rationale.
  */
 static int compare_block_csum_digest(const void *a, const void *b)
 {
 	return memcmp(((const struct block_csum *)a)->digest,
 		      ((const struct block_csum *)b)->digest,
+		      DIGEST_LEN);
+}
+
+static int compare_extent_csum_digest(const void *a, const void *b)
+{
+	return memcmp(((const struct extent_csum *)a)->digest,
+		      ((const struct extent_csum *)b)->digest,
 		      DIGEST_LEN);
 }
 
@@ -1211,6 +1218,18 @@ static void csum_whole_file(struct file_to_scan *file)
 
 
 	if (hashes.extents_index != 0) {
+		/*
+		 * Same sort-by-digest treatment as the blocks array
+		 * above: keep idx_extents_digest_len's inserts
+		 * sequential so its leaves stay cache-resident.
+		 * Extents are far fewer than blocks (one per
+		 * physical extent), so the sort cost here is
+		 * negligible.
+		 */
+		qsort(hashes.extents, hashes.extents_index,
+		      sizeof(struct extent_csum),
+		      compare_extent_csum_digest);
+
 		ret = dbfile_store_extent_hashes(db, file->fileid, hashes.extents_index, hashes.extents);
 		if (ret) {
 			dbfile_abort_trans(db->db);

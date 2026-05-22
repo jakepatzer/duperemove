@@ -151,19 +151,37 @@ static int create_tables(sqlite3 *db)
 	if (ret)
 		goto out;
 
+/*
+ * The UNIQUE(fileid, loff, len) constraint was previously here. It
+ * forced SQLite to maintain an implicit autoindex on (fileid, loff,
+ * len), which becomes a random-key index at insertion time once the
+ * extent array is sorted by digest before INSERT (the sort eliminates
+ * the digest-index thrash but inadvertently scrambles loff order
+ * inside the autoindex). At scale that random autoindex was the
+ * dominant SQLite cache-thrash source. We drop the UNIQUE constraint
+ * here: the application never re-inserts the same (fileid, loff, len)
+ * row in a single scan, and find_dupes does not depend on uniqueness
+ * for correctness.
+ */
 #define	CREATE_TABLE_EXTENTS						\
 "CREATE TABLE IF NOT EXISTS extents(digest BLOB KEY NOT NULL, "		\
 "fileid INTEGER, loff INTEGER, poff INTEGER, len INTEGER, "		\
-"UNIQUE(fileid, loff, len) "						\
 "FOREIGN KEY(fileid) REFERENCES files(id) ON DELETE CASCADE);"
 	ret = sqlite3_exec(db, CREATE_TABLE_EXTENTS, NULL, NULL, NULL);
 	if (ret)
 		goto out;
 
+/*
+ * The UNIQUE(fileid, loff) constraint was previously here. See the
+ * matching comment above CREATE_TABLE_EXTENTS for the rationale; the
+ * same random-autoindex cache thrash applied to the blocks table
+ * after sort-by-digest. The application never re-inserts the same
+ * (fileid, loff) row in a single scan, and no query in the codebase
+ * depends on the uniqueness for correctness.
+ */
 #define	CREATE_TABLE_BLOCKS						\
 "CREATE TABLE IF NOT EXISTS blocks(digest BLOB KEY NOT NULL, "		\
 "fileid INTEGER, loff INTEGER, "					\
-"UNIQUE(fileid, loff) "							\
 "FOREIGN KEY(fileid) REFERENCES files(id) ON DELETE CASCADE);"
 	ret = sqlite3_exec(db, CREATE_TABLE_BLOCKS, NULL, NULL, NULL);
 
@@ -242,7 +260,17 @@ static int dbfile_set_modes(sqlite3 *db)
 		return ret;
 	}
 
-	ret = sqlite3_exec(db, "PRAGMA cache_size = -256000", NULL, NULL, NULL);
+	/*
+	 * 4 GiB SQLite page cache. The previous 256 MiB default was
+	 * smaller than the per-file index working set at our scale
+	 * (1 TB file -> ~8 GB digest index, ~2 GB even for 250 GB),
+	 * which produced severe cache thrash and runaway WAL growth
+	 * during the per-file commit. 4 GiB comfortably absorbs the
+	 * working set for sub-TB files and substantially helps the
+	 * larger ones, while staying well inside the per-thread RAM
+	 * budget alongside the per-file scan buffer.
+	 */
+	ret = sqlite3_exec(db, "PRAGMA cache_size = -4000000", NULL, NULL, NULL);
 	if (ret) {
 		perror_sqlite(ret, "configuring database (cache size)");
 		return ret;
