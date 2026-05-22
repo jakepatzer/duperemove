@@ -998,6 +998,20 @@ static inline bool is_inlined(struct scan_ctxt *ctxt)
 	return extent && extent->fe_flags & FIEMAP_EXTENT_DATA_INLINE;
 }
 
+/*
+ * Comparator for sorting the per-file block_csum array by digest
+ * before bulk-inserting into the blocks table. Sorting turns the
+ * random-XXH128 insert pattern into a sequential one for the
+ * idx_blocks_digest B-tree, which is the dominant cost at scale.
+ * See dbfile_store_block_hashes call site below for the rationale.
+ */
+static int compare_block_csum_digest(const void *a, const void *b)
+{
+	return memcmp(((const struct block_csum *)a)->digest,
+		      ((const struct block_csum *)b)->digest,
+		      DIGEST_LEN);
+}
+
 static void csum_whole_file(struct file_to_scan *file)
 {
 	int ret = 0;
@@ -1165,6 +1179,27 @@ static void csum_whole_file(struct file_to_scan *file)
 
 	/* Do not store the blocks if the file is inlined */
 	if (hashes.blocks_index != 0 && !is_inlined(&ctxt)) {
+		/*
+		 * Sort the per-file block hashes by digest so the
+		 * subsequent inserts into the blocks table walk
+		 * idx_blocks_digest in order. Without this sort, each
+		 * INSERT lands on a uniformly-random leaf page of the
+		 * digest index; once the index exceeds SQLite's page
+		 * cache (~256 MiB) the per-insert cost collapses to
+		 * one random SSD read + one WAL frame, producing
+		 * cache-thrash that takes days to commit a single
+		 * large file. Sorting first keeps the active leaf
+		 * page resident and reduces the commit from days to
+		 * tens of minutes per terabyte. The sort itself is in
+		 * place (no extra allocation) and takes about a
+		 * minute per 6 GB of block_csum array. Row order in
+		 * the blocks table changes (rowid is assigned in
+		 * insert order); no query depends on rowid.
+		 */
+		qsort(hashes.blocks, hashes.blocks_index,
+		      sizeof(struct block_csum),
+		      compare_block_csum_digest);
+
 		ret = dbfile_store_block_hashes(db, file->fileid,
 						hashes.blocks_index, hashes.blocks);
 		if (ret) {
