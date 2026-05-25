@@ -244,6 +244,68 @@ out:
 	return ret;
 }
 
+/*
+ * Standard SQLite bulk-load pattern: drop the secondary indexes on the
+ * blocks/extents tables before the hash phase, then rebuild them once.
+ * During scan_files() each INSERT would otherwise have to update both
+ * B-tree indexes; once those indexes exceed the page cache, every
+ * insert becomes random I/O on the hashfile and throughput collapses.
+ * The scan phase never queries these indexes, and they can be rebuilt
+ * from a sorted table scan in a single pass at the end. The unique
+ * constraint that backs row uniqueness lives on the table itself (the
+ * implicit rowid), so dropping these does not affect correctness.
+ */
+int dbfile_drop_bulk_load_indexes(sqlite3 *db)
+{
+	int ret;
+
+	ret = sqlite3_exec(db, "drop index if exists idx_blocks_digest;",
+			   NULL, NULL, NULL);
+	if (ret)
+		goto out;
+
+	ret = sqlite3_exec(db, "drop index if exists idx_blocks_fileid;",
+			   NULL, NULL, NULL);
+	if (ret)
+		goto out;
+
+	ret = sqlite3_exec(db, "drop index if exists idx_extents_digest_len;",
+			   NULL, NULL, NULL);
+	if (ret)
+		goto out;
+
+	ret = sqlite3_exec(db, "drop index if exists idx_extents_fileid;",
+			   NULL, NULL, NULL);
+out:
+	if (ret)
+		perror_sqlite(ret, "dropping bulk-load indexes");
+	return ret;
+}
+
+int dbfile_create_bulk_load_indexes(sqlite3 *db)
+{
+	int ret;
+
+	ret = sqlite3_exec(db, CREATE_BLOCKS_DIGEST_INDEX, NULL, NULL, NULL);
+	if (ret)
+		goto out;
+
+	ret = sqlite3_exec(db, CREATE_BLOCKS_FILEID_INDEX, NULL, NULL, NULL);
+	if (ret)
+		goto out;
+
+	ret = sqlite3_exec(db, CREATE_EXTENTS_DIGEST_LEN_INDEX,
+			   NULL, NULL, NULL);
+	if (ret)
+		goto out;
+
+	ret = sqlite3_exec(db, CREATE_EXTENTS_FILEID_INDEX, NULL, NULL, NULL);
+out:
+	if (ret)
+		perror_sqlite(ret, "creating bulk-load indexes");
+	return ret;
+}
+
 static int dbfile_set_modes(sqlite3 *db)
 {
 	int ret;

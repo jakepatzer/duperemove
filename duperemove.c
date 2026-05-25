@@ -790,7 +790,34 @@ int main(int argc, char **argv)
 			goto out;
 		}
 
+		/*
+		 * --write-hashes is a pure bulk-insert phase. Drop the
+		 * blocks/extents secondary indexes so each INSERT is
+		 * not maintaining two B-trees that have outgrown the
+		 * SQLite page cache (the dominant source of progressive
+		 * slowdown as the hashfile grows), and rebuild them in
+		 * a single pass after scan_files() completes. Always
+		 * attempt the rebuild, even on scan failure, so the
+		 * hashfile is left in a state --lookup-only accepts.
+		 * We restrict this to H_WRITE: H_UPDATE may be reusing
+		 * an already-populated hashfile where dropping a large
+		 * existing index just to rebuild it would be a net
+		 * loss.
+		 */
+		if (use_hashfile == H_WRITE) {
+			ret = dbfile_drop_bulk_load_indexes(db->db);
+			if (ret)
+				goto out;
+		}
+
 		ret = scan_files(argc, argv, filelist_idx, db);
+
+		if (use_hashfile == H_WRITE) {
+			int idx_ret = dbfile_create_bulk_load_indexes(db->db);
+			if (!ret)
+				ret = idx_ret;
+		}
+
 		if (ret)
 			goto out;
 
