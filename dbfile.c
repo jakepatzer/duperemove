@@ -25,6 +25,30 @@
 
 static struct dbhandle *gdb = NULL;
 
+/*
+ * Process-local flag coordinating the H_WRITE bulk-load pattern with
+ * worker connections opened later by dbfile_open_handle_thread().
+ *
+ * dbfile_drop_bulk_load_indexes() sets this true before issuing the
+ * DROP statements; dbfile_create_bulk_load_indexes() clears it after
+ * the rebuild succeeds. While set, create_indexes() skips the
+ * digest indexes (idx_blocks_digest, idx_extents_digest_len) so that
+ * a worker thread opening its first SQLite connection mid-scan does
+ * not silently rebuild the indexes we just dropped (which would both
+ * undo the optimization and block the worker for the duration of the
+ * rebuild). The fileid indexes are always created so worker DELETEs
+ * via dbfile_remove_hashes() keep using them.
+ *
+ * Synchronization: the flag is set by the main thread before any
+ * worker is spawned, and cleared after scan_files() returns (i.e.
+ * after all workers have joined). g_thread_pool_push and pthread
+ * thread creation establish happens-before between the main thread's
+ * write and each worker's first read, so no explicit barrier or
+ * mutex is required for the bool itself; reads under dbfile_lock()
+ * via dbfile_open_handle_thread() are an additional safety net.
+ */
+static bool dbfile_skip_digest_index_creation = false;
+
 static sqlite3 *__dbfile_open_handle(char *filename, bool force_create);
 
 static GMutex io_mutex; /* Locks db writes */
@@ -194,13 +218,16 @@ out:
 
 static int create_indexes(sqlite3 *db)
 {
-	int ret;
+	int ret = 0;
 
 #define CREATE_BLOCKS_DIGEST_INDEX					\
 "create index if not exists idx_blocks_digest on blocks(digest);"
-	ret = sqlite3_exec(db, CREATE_BLOCKS_DIGEST_INDEX, NULL, NULL, NULL);
-	if (ret)
-		goto out;
+	if (!dbfile_skip_digest_index_creation) {
+		ret = sqlite3_exec(db, CREATE_BLOCKS_DIGEST_INDEX,
+				   NULL, NULL, NULL);
+		if (ret)
+			goto out;
+	}
 
 #define CREATE_BLOCKS_FILEID_INDEX					\
 "create index if not exists idx_blocks_fileid on blocks(fileid);"
@@ -210,9 +237,12 @@ static int create_indexes(sqlite3 *db)
 
 #define CREATE_EXTENTS_DIGEST_LEN_INDEX					\
 "create index if not exists idx_extents_digest_len on extents(digest, len);"
-	ret = sqlite3_exec(db, CREATE_EXTENTS_DIGEST_LEN_INDEX, NULL, NULL, NULL);
-	if (ret)
-		goto out;
+	if (!dbfile_skip_digest_index_creation) {
+		ret = sqlite3_exec(db, CREATE_EXTENTS_DIGEST_LEN_INDEX,
+				   NULL, NULL, NULL);
+		if (ret)
+			goto out;
+	}
 
 #define CREATE_EXTENTS_FILEID_INDEX					\
 "create index if not exists idx_extents_fileid on extents(fileid);"
@@ -245,36 +275,52 @@ out:
 }
 
 /*
- * Standard SQLite bulk-load pattern: drop the secondary indexes on the
- * blocks/extents tables before the hash phase, then rebuild them once.
- * During scan_files() each INSERT would otherwise have to update both
- * B-tree indexes; once those indexes exceed the page cache, every
- * insert becomes random I/O on the hashfile and throughput collapses.
- * The scan phase never queries these indexes, and they can be rebuilt
- * from a sorted table scan in a single pass at the end. The unique
- * constraint that backs row uniqueness lives on the table itself (the
- * implicit rowid), so dropping these does not affect correctness.
+ * Standard SQLite bulk-load pattern, applied selectively. Only the
+ * digest indexes (idx_blocks_digest, idx_extents_digest_len) are
+ * dropped before the hash phase, because those are the ones that
+ * thrash: digests are uniformly random, so each INSERT lands on a
+ * random leaf page; once the digest index exceeds the page cache,
+ * every insert becomes random I/O on the hashfile and throughput
+ * collapses.
+ *
+ * The fileid indexes (idx_blocks_fileid, idx_extents_fileid) are
+ * deliberately KEPT. They are required during the scan phase by:
+ *   - REMOVE_BLOCK_HASHES / REMOVE_EXTENT_HASHES, which run from
+ *     dbfile_remove_hashes() in __scan_file() for every file that
+ *     already has prior hashes (the rescan-existing-file path).
+ *     Without these indexes those DELETEs become full table scans.
+ *   - The FK ON DELETE CASCADE from files -> blocks/extents fired
+ *     by dbfile_prune_unscanned_files().
+ * Fileid inserts during scan don't thrash because within a single
+ * file's commit every row shares the same fileid, so all writes
+ * land on one leaf page of the fileid index.
+ *
+ * The digest indexes are rebuilt from a sorted table scan in a
+ * single pass after scan_files() completes. --lookup-only verifies
+ * idx_blocks_digest is present at open time, so the rebuild must
+ * succeed before the hashfile is considered written.
  */
 int dbfile_drop_bulk_load_indexes(sqlite3 *db)
 {
 	int ret;
+
+	/*
+	 * Set the flag before issuing the DROPs so any worker thread
+	 * that races our drop by opening its connection concurrently
+	 * will skip digest-index creation in create_indexes(). Worker
+	 * threads have not been spawned yet at the point this is
+	 * called from main(), but the ordering keeps the invariant
+	 * "flag set => digest indexes intentionally absent" simple to
+	 * reason about during error recovery.
+	 */
+	dbfile_skip_digest_index_creation = true;
 
 	ret = sqlite3_exec(db, "drop index if exists idx_blocks_digest;",
 			   NULL, NULL, NULL);
 	if (ret)
 		goto out;
 
-	ret = sqlite3_exec(db, "drop index if exists idx_blocks_fileid;",
-			   NULL, NULL, NULL);
-	if (ret)
-		goto out;
-
 	ret = sqlite3_exec(db, "drop index if exists idx_extents_digest_len;",
-			   NULL, NULL, NULL);
-	if (ret)
-		goto out;
-
-	ret = sqlite3_exec(db, "drop index if exists idx_extents_fileid;",
 			   NULL, NULL, NULL);
 out:
 	if (ret)
@@ -290,20 +336,27 @@ int dbfile_create_bulk_load_indexes(sqlite3 *db)
 	if (ret)
 		goto out;
 
-	ret = sqlite3_exec(db, CREATE_BLOCKS_FILEID_INDEX, NULL, NULL, NULL);
-	if (ret)
-		goto out;
-
 	ret = sqlite3_exec(db, CREATE_EXTENTS_DIGEST_LEN_INDEX,
 			   NULL, NULL, NULL);
-	if (ret)
-		goto out;
-
-	ret = sqlite3_exec(db, CREATE_EXTENTS_FILEID_INDEX, NULL, NULL, NULL);
 out:
-	if (ret)
+	if (ret) {
 		perror_sqlite(ret, "creating bulk-load indexes");
-	return ret;
+		/*
+		 * Leave dbfile_skip_digest_index_creation set on
+		 * failure: the digest indexes did not get rebuilt, so
+		 * any subsequent worker connection that opens in this
+		 * same process should still NOT recreate them
+		 * (CREATE INDEX on a populated table is the very cost
+		 * we are trying to avoid). The hashfile is in an
+		 * incomplete state and will be repaired by the next
+		 * full run's dbfile_prepare() -> create_indexes()
+		 * call, which starts with the flag clear.
+		 */
+		return ret;
+	}
+
+	dbfile_skip_digest_index_creation = false;
+	return 0;
 }
 
 static int dbfile_set_modes(sqlite3 *db)

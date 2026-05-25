@@ -84,11 +84,15 @@ void dbfile_close_handle(struct dbhandle *db);
 struct dbhandle *dbfile_open_handle_thread(char *filename, struct threads_pool *pool);
 
 /*
- * Bulk-load helpers. Used by the --write-hashes path to drop the
- * blocks/extents secondary indexes around scan_files() so that bulk
- * INSERTs are not paying per-row B-tree maintenance cost. The indexes
- * are rebuilt before the hashfile is considered written; --lookup-only
- * verifies they exist via dbfile_open_handle_readonly().
+ * Bulk-load helpers used by the --write-hashes path. Drop *only* the
+ * digest indexes (idx_blocks_digest, idx_extents_digest_len) around
+ * scan_files() so that bulk INSERTs into the digest B-trees do not
+ * thrash random pages of an out-of-cache index. The fileid indexes
+ * (idx_blocks_fileid, idx_extents_fileid) are NOT dropped: they are
+ * needed during scan by dbfile_remove_hashes() and by the FK cascade
+ * in dbfile_prune_unscanned_files(). Dropping them would turn those
+ * DELETEs into full-table scans. See the long comment above the
+ * implementations in dbfile.c for the full rationale.
  */
 int dbfile_drop_bulk_load_indexes(sqlite3 *db);
 int dbfile_create_bulk_load_indexes(sqlite3 *db);

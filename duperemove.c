@@ -784,30 +784,51 @@ int main(int argc, char **argv)
 	print_header();
 
 	if (use_hashfile == H_WRITE || use_hashfile == H_UPDATE) {
-		ret = dbfile_prune_unscanned_files(db);
-		if (ret) {
-			eprintf("Unable to prune unscanned files\n");
-			goto out;
-		}
-
 		/*
-		 * --write-hashes is a pure bulk-insert phase. Drop the
-		 * blocks/extents secondary indexes so each INSERT is
-		 * not maintaining two B-trees that have outgrown the
-		 * SQLite page cache (the dominant source of progressive
-		 * slowdown as the hashfile grows), and rebuild them in
-		 * a single pass after scan_files() completes. Always
-		 * attempt the rebuild, even on scan failure, so the
-		 * hashfile is left in a state --lookup-only accepts.
-		 * We restrict this to H_WRITE: H_UPDATE may be reusing
-		 * an already-populated hashfile where dropping a large
-		 * existing index just to rebuild it would be a net
-		 * loss.
+		 * Bulk-load pattern for --write-hashes: drop the digest
+		 * indexes on blocks/extents up front, rebuild them once
+		 * at the end. Digests are uniformly random, so without
+		 * this each INSERT during scan thrashes random leaf
+		 * pages of a multi-GB index that doesn't fit in the
+		 * SQLite page cache, and per-file commit time grows
+		 * unboundedly with hashfile size.
+		 *
+		 * The drop runs BEFORE dbfile_prune_unscanned_files so
+		 * the prune's FK cascade through blocks/extents (rows
+		 * deleted for files with digest IS NULL, e.g. files
+		 * left half-scanned by a prior kill) is not paying
+		 * per-row digest-index maintenance. The cascade still
+		 * uses idx_blocks_fileid / idx_extents_fileid, which
+		 * are deliberately NOT dropped (see dbfile.c).
+		 *
+		 * Restricted to H_WRITE: H_UPDATE is the incremental
+		 * path where dropping/rebuilding indexes on an
+		 * already-populated hashfile may be a net loss versus
+		 * letting the existing indexes absorb the smaller set
+		 * of new inserts.
+		 *
+		 * The rebuild is attempted unconditionally after
+		 * scan_files() so the hashfile is left in a state
+		 * --lookup-only accepts even when scan fails partway
+		 * through. The original scan error code is preserved.
 		 */
 		if (use_hashfile == H_WRITE) {
 			ret = dbfile_drop_bulk_load_indexes(db->db);
 			if (ret)
 				goto out;
+		}
+
+		ret = dbfile_prune_unscanned_files(db);
+		if (ret) {
+			eprintf("Unable to prune unscanned files\n");
+			if (use_hashfile == H_WRITE) {
+				int idx_ret = dbfile_create_bulk_load_indexes(db->db);
+				if (idx_ret)
+					eprintf("Index rebuild also failed; "
+						"hashfile left without "
+						"digest indexes.\n");
+			}
+			goto out;
 		}
 
 		ret = scan_files(argc, argv, filelist_idx, db);
