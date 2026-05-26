@@ -223,6 +223,22 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 
 			st->seed_matches_found++;
 
+			/*
+			 * Per (src, dst) high-water suppression. Done
+			 * BEFORE filerec_find / load / open because the
+			 * check needs only the two fileids and the dst
+			 * offset - no filerec object required. Saves a
+			 * rbtree walk, a possible SQL query, and a
+			 * possible open(2) for every match that lands
+			 * inside a previously-deduped range, which on
+			 * --lookup-self workloads can be the majority
+			 * of matches in the tail of a long contiguous
+			 * dedupe.
+			 */
+			if (options.coalesce &&
+			    coalesce_covered(ref_id, file_fr->fileid, off))
+				continue;
+
 			ref = filerec_find(ref_id);
 			if (ref == NULL) {
 				if (dbfile_load_one_filerec(st->db, ref_id,
@@ -242,11 +258,6 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 					"skipping match.\n", ref->filename);
 				continue;
 			}
-
-			/* Per (src, dst) high-water suppression. */
-			if (options.coalesce &&
-			    coalesce_covered(ref_id, file_fr->fileid, off))
-				continue;
 
 			ext_len = blocksize;
 			if (options.coalesce)
