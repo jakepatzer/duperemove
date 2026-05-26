@@ -203,6 +203,7 @@ uint64_t extend_match(struct filerec *tgt, uint64_t tgt_off,
 	char *buf_a, *buf_b;
 	uint64_t len = seed_len;
 	uint64_t tgt_max, dst_max, ceiling;
+	uint64_t chunk;
 
 	if (coalesce_get_bufs(&buf_a, &buf_b)) {
 		eprintf("Warning: out of memory for coalesce buffers; "
@@ -222,12 +223,41 @@ uint64_t extend_match(struct filerec *tgt, uint64_t tgt_off,
 	dst_max = dst->size - dst_off;
 	ceiling = tgt_max < dst_max ? tgt_max : dst_max;
 
+	/*
+	 * Exponential chunk ramp.
+	 *
+	 * The dominant cost in --lookup-only mode is extend_match's
+	 * "src-side" pread (the random one at ref_loff), and most
+	 * digest matches diverge within the first chunk - the hash
+	 * collision happens to land on a fluke run of identical bytes
+	 * but the next 4 KiB already differs. With a fixed 128 KiB
+	 * chunk that termination cost 256 KiB of read traffic (one
+	 * chunk on each side) to discover a 4 KiB match that gets
+	 * thrown away by --min-dedupe-size. Starting at seed_len
+	 * (== blocksize, typically 4 KiB) and doubling per matched
+	 * iteration up to COALESCE_CHUNK keeps the short-match
+	 * termination cost proportional to the actual match length,
+	 * while long matches still converge to the 128 KiB-chunk
+	 * throughput regime within ~5 iterations.
+	 *
+	 * buf_a/buf_b are sized for COALESCE_CHUNK; clamp the initial
+	 * chunk to that ceiling so we never overrun them even if
+	 * seed_len is larger than COALESCE_CHUNK (would only happen
+	 * if a future caller passed a non-blocksize seed). Guard
+	 * seed_len==0 defensively.
+	 */
+	chunk = seed_len;
+	if (chunk == 0)
+		chunk = COALESCE_ALIGN;
+	if (chunk > COALESCE_CHUNK)
+		chunk = COALESCE_CHUNK;
+
 	while (len < ceiling) {
 		uint64_t want = ceiling - len;
 		ssize_t ra, rb, cmp;
 
-		if (want > COALESCE_CHUNK)
-			want = COALESCE_CHUNK;
+		if (want > chunk)
+			want = chunk;
 
 		ra = pread(tgt->fd, buf_a, want, tgt_off + len);
 		if (ra <= 0) {
@@ -262,6 +292,18 @@ uint64_t extend_match(struct filerec *tgt, uint64_t tgt_off,
 		len += cmp;
 		if (cmp < (ssize_t)want)
 			break;	/* short read - treat as EOF */
+
+		/*
+		 * Successful full-chunk match - ramp up to amortize
+		 * syscall and seek overhead on long matches. Cap at
+		 * COALESCE_CHUNK (the buf size); the cap is also what
+		 * keeps the doubling from overflowing.
+		 */
+		if (chunk < COALESCE_CHUNK) {
+			chunk *= 2;
+			if (chunk > COALESCE_CHUNK)
+				chunk = COALESCE_CHUNK;
+		}
 	}
 
 	/* Align down to the btrfs dedup unit; never below seed_len. */
