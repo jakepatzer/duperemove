@@ -188,6 +188,25 @@ static int submit_pair_dedupe(struct filerec *src, uint64_t src_off,
  * Per-iteration cost when throttled-out: one clock_gettime via
  * vDSO (~20 ns). Negligible even at 1M iter/sec.
  */
+/*
+ * Always-human-readable size formatter for the progress line.
+ * pretty_size() respects the global `human_readable` flag (set by -h),
+ * but the streaming progress line is unreadable at multi-GB scale
+ * without unit suffixes, so format unconditionally here.
+ */
+static void fmt_size_h(uint64_t size, char *str, size_t str_bytes)
+{
+	static const char *units[] = { "B", "K", "M", "G", "T", "P", "E" };
+	unsigned int u = 0;
+	double v = (double)size;
+
+	while (v >= 1024.0 && u + 1 < sizeof(units) / sizeof(units[0])) {
+		v /= 1024.0;
+		u++;
+	}
+	snprintf(str, str_bytes, "%.1f%s", v, units[u]);
+}
+
 static void print_progress(struct lookup_state *st, const char *path,
 			   uint64_t off, uint64_t size, bool final)
 {
@@ -197,6 +216,7 @@ static void print_progress(struct lookup_state *st, const char *path,
 	double speed_now_mbs, speed_avg_mbs;
 	const char *name;
 	int hrs, mins;
+	char deduped_buf[16];
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	elapsed_since = (now.tv_sec - st->last_progress_time.tv_sec) +
@@ -228,31 +248,35 @@ static void print_progress(struct lookup_state *st, const char *path,
 	hrs = (int)(elapsed_total / 3600);
 	mins = (int)((elapsed_total - hrs * 3600) / 60);
 
+	fmt_size_h(st->bytes_deduped, deduped_buf, sizeof(deduped_buf));
+
 	if (st->is_tty && !final) {
 		fprintf(stderr,
 			"[lookup] file %"PRIu64" \"%s\" %5.1f%% | "
 			"%5.0f MB/s now %5.0f avg | "
-			"attempts %"PRIu64" ok %"PRIu64" | "
+			"cand %"PRIu64" attempts %"PRIu64" ok %"PRIu64" | "
 			"deduped %s | %dh%02dm\033[K\r",
 			st->n_lookup_files + st->n_self_files + 1,
 			name,
 			size > 0 ? (100.0 * off / size) : 0.0,
 			speed_now_mbs, speed_avg_mbs,
+			st->seed_matches_found,
 			st->dedupe_attempts, st->matches_deduped,
-			pretty_size(st->bytes_deduped),
+			deduped_buf,
 			hrs, mins);
 	} else {
 		fprintf(stderr,
 			"[lookup] file %"PRIu64" \"%s\" %5.1f%% | "
 			"%5.0f MB/s now %5.0f avg | "
-			"attempts %"PRIu64" ok %"PRIu64" | "
+			"cand %"PRIu64" attempts %"PRIu64" ok %"PRIu64" | "
 			"deduped %s | %dh%02dm\n",
 			st->n_lookup_files + st->n_self_files + 1,
 			name,
 			size > 0 ? (100.0 * off / size) : 0.0,
 			speed_now_mbs, speed_avg_mbs,
+			st->seed_matches_found,
 			st->dedupe_attempts, st->matches_deduped,
-			pretty_size(st->bytes_deduped),
+			deduped_buf,
 			hrs, mins);
 	}
 	fflush(stderr);
@@ -361,6 +385,16 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 
 		if (options.skip_zeroes && block_is_zero(block, blocksize)) {
 			off += blocksize;
+			/*
+			 * Zero-skip bypasses the bottom-of-loop
+			 * bytes_scanned_total update and print_progress
+			 * call, so account for the advance here.
+			 * Without this, files with large zero regions
+			 * (typical for raw disk images) show 0 MB/s and
+			 * the throttled progress line never fires, even
+			 * though `off` is racing forward.
+			 */
+			st->bytes_scanned_total += blocksize;
 			continue;
 		}
 
@@ -372,6 +406,7 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 			eprintf("lookup: sqlite3_bind_blob failed: %d\n", rc);
 			sqlite3_reset(stmt);
 			off += blocksize;
+			st->bytes_scanned_total += blocksize;
 			continue;
 		}
 
