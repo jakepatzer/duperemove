@@ -158,9 +158,42 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 	char *buf;
 	sqlite3_stmt *stmt = st->find_block_stmt;
 	uint64_t off = 0;
+	/*
+	 * Outer-loop read buffering. The streaming scan walks the file
+	 * one block (typically 4 KiB) at a time, but issuing a
+	 * separate pread per block costs one syscall per block (~62.5 M
+	 * for a 250 GB file). Fold N consecutive blocks into one pread
+	 * of size LOOKUP_READ_BUF_SIZE; subsequent blocks are served
+	 * from the in-process buffer instead. The kernel's page cache
+	 * already absorbs sequential 4 KiB preads, so this is a
+	 * syscall + buffer-management cost reduction, not a disk-I/O
+	 * reduction.
+	 *
+	 * The buffer is refilled from `off` whenever the current block
+	 * is not entirely contained in it. That handles two cases
+	 * cleanly: (1) the normal block-by-block advance just falls
+	 * off the end of the current buffer after N blocks, and (2) a
+	 * successful dedupe causes `off` to jump forward by the
+	 * deduped range's length, which may skip past the buffer
+	 * entirely - we just discard and refill at the new `off`.
+	 *
+	 * Buffer size must be >= blocksize. If the caller runs with a
+	 * blocksize larger than LOOKUP_READ_BUF_SIZE we size up
+	 * automatically rather than refusing; in that regime the
+	 * buffering degrades to one pread per block (the same as
+	 * before this change), which is correct but offers no
+	 * speedup.
+	 */
+#define LOOKUP_READ_BUF_SIZE (64 * 1024)
+	size_t buf_size = LOOKUP_READ_BUF_SIZE;
+	uint64_t buf_file_off = 0;
+	size_t buf_valid = 0;
 	int rc = 0;
 
-	buf = malloc(blocksize);
+	if (buf_size < blocksize)
+		buf_size = blocksize;
+
+	buf = malloc(buf_size);
 	if (buf == NULL)
 		return ENOMEM;
 
@@ -169,25 +202,51 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 		st->n_lookup_files + st->n_self_files + 1);
 
 	while (off + blocksize <= size) {
-		ssize_t rd;
 		unsigned char digest[DIGEST_LEN];
 		uint64_t advance = blocksize;
+		char *block;
 
-		rd = pread(file_fr->fd, buf, blocksize, off);
-		if (rd != (ssize_t)blocksize) {
-			if (rd < 0)
-				eprintf("lookup: pread \"%s\" @ %"PRIu64
-					": %s\n", path, off, strerror(errno));
-			/* short read: treat as EOF and stop */
-			break;
+		/*
+		 * Ensure the current block lives entirely within the
+		 * buffer. If the buffer is empty (first iteration),
+		 * exhausted (sequential advance walked off the end),
+		 * or behind us (large advance after a successful
+		 * dedupe), refill from `off`. We never need to look
+		 * backward because the outer loop is monotonic in
+		 * `off`.
+		 */
+		if (off < buf_file_off ||
+		    off + blocksize > buf_file_off + buf_valid) {
+			ssize_t rd;
+
+			buf_file_off = off;
+			rd = pread(file_fr->fd, buf, buf_size, off);
+			if (rd < (ssize_t)blocksize) {
+				if (rd < 0)
+					eprintf("lookup: pread \"%s\" @ "
+						"%"PRIu64": %s\n",
+						path, off, strerror(errno));
+				/*
+				 * Either a hard error or a short read
+				 * that can't form a full block - treat
+				 * as EOF and stop. The outer-loop guard
+				 * (off + blocksize <= size) normally
+				 * keeps us in-bounds, but the file may
+				 * have shrunk between scan and now.
+				 */
+				break;
+			}
+			buf_valid = (size_t)rd;
 		}
 
-		if (options.skip_zeroes && block_is_zero(buf, rd)) {
+		block = buf + (off - buf_file_off);
+
+		if (options.skip_zeroes && block_is_zero(block, blocksize)) {
 			off += blocksize;
 			continue;
 		}
 
-		checksum_block(buf, (int)rd, digest);
+		checksum_block(block, (int)blocksize, digest);
 
 		rc = sqlite3_bind_blob(stmt, 1, digest, DIGEST_LEN,
 				       SQLITE_STATIC);
