@@ -22,6 +22,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <time.h>
 
 #include <glib.h>
 #include <sqlite3.h>
@@ -66,6 +67,24 @@ struct lookup_state {
 	uint64_t	n_self_files;		/* reference files
 						 * stream-processed under
 						 * --lookup-self */
+
+	/*
+	 * Real-time progress tracking. Updated by stream_blocks; the
+	 * print is throttled to one emit per ~2 seconds in
+	 * print_progress(). bytes_scanned_total is the cumulative
+	 * outer-loop advance across all files; bytes_scanned_at_last
+	 * is the value at the previous emit (for short-window speed).
+	 * progress_active is per-file: set true on first emit during
+	 * the current file, reset to false at start of each new file
+	 * so we can decide whether to emit a final per-file summary
+	 * line.
+	 */
+	struct timespec	start_time;
+	struct timespec	last_progress_time;
+	uint64_t	bytes_scanned_total;
+	uint64_t	bytes_scanned_at_last;
+	int		is_tty;
+	bool		progress_active;
 };
 
 static bool block_is_zero(const char *buf, size_t len)
@@ -152,6 +171,97 @@ static int submit_pair_dedupe(struct filerec *src, uint64_t src_off,
  * Returns 0 on a normal completion (including when no matches were
  * found) or ENOMEM if the block buffer cannot be allocated.
  */
+/*
+ * Throttled real-time progress line for --lookup-only.
+ *
+ * Called once per outer-loop iteration in stream_blocks; emits at
+ * most one line per ~2 seconds of wall-clock time per file. On a
+ * TTY, the line is rewritten in place via \r + ANSI clear-to-EOL so
+ * the terminal stays clean. Off-TTY (log files, pipes), each emit
+ * is a separate \n-terminated line so the log is grep-friendly.
+ *
+ * `final` forces an emit regardless of the throttle and always uses
+ * \n - used at the end of each file's stream_blocks to "commit" the
+ * progress line before the next file's "scanning ..." qprintf
+ * lands on stdout.
+ *
+ * Per-iteration cost when throttled-out: one clock_gettime via
+ * vDSO (~20 ns). Negligible even at 1M iter/sec.
+ */
+static void print_progress(struct lookup_state *st, const char *path,
+			   uint64_t off, uint64_t size, bool final)
+{
+	struct timespec now;
+	double elapsed_since, elapsed_total;
+	uint64_t bytes_since;
+	double speed_now_mbs, speed_avg_mbs;
+	const char *name;
+	int hrs, mins;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	elapsed_since = (now.tv_sec - st->last_progress_time.tv_sec) +
+			(now.tv_nsec - st->last_progress_time.tv_nsec) / 1e9;
+
+	if (!final && elapsed_since < 2.0)
+		return;
+	/*
+	 * Final-emit is only useful if at least one in-progress line
+	 * was already shown for this file. For files that complete in
+	 * under one throttle window the file is fast enough that the
+	 * end-of-run summary is sufficient; skipping avoids noise.
+	 */
+	if (final && !st->progress_active)
+		return;
+
+	elapsed_total = (now.tv_sec - st->start_time.tv_sec) +
+			(now.tv_nsec - st->start_time.tv_nsec) / 1e9;
+	bytes_since = st->bytes_scanned_total - st->bytes_scanned_at_last;
+
+	speed_now_mbs = (elapsed_since > 0.001) ?
+		(bytes_since / 1048576.0 / elapsed_since) : 0.0;
+	speed_avg_mbs = (elapsed_total > 0.001) ?
+		(st->bytes_scanned_total / 1048576.0 / elapsed_total) : 0.0;
+
+	name = strrchr(path, '/');
+	name = name ? name + 1 : path;
+
+	hrs = (int)(elapsed_total / 3600);
+	mins = (int)((elapsed_total - hrs * 3600) / 60);
+
+	if (st->is_tty && !final) {
+		fprintf(stderr,
+			"[lookup] file %"PRIu64" \"%s\" %5.1f%% | "
+			"%5.0f MB/s now %5.0f avg | "
+			"attempts %"PRIu64" ok %"PRIu64" | "
+			"deduped %s | %dh%02dm\033[K\r",
+			st->n_lookup_files + st->n_self_files + 1,
+			name,
+			size > 0 ? (100.0 * off / size) : 0.0,
+			speed_now_mbs, speed_avg_mbs,
+			st->dedupe_attempts, st->matches_deduped,
+			pretty_size(st->bytes_deduped),
+			hrs, mins);
+	} else {
+		fprintf(stderr,
+			"[lookup] file %"PRIu64" \"%s\" %5.1f%% | "
+			"%5.0f MB/s now %5.0f avg | "
+			"attempts %"PRIu64" ok %"PRIu64" | "
+			"deduped %s | %dh%02dm\n",
+			st->n_lookup_files + st->n_self_files + 1,
+			name,
+			size > 0 ? (100.0 * off / size) : 0.0,
+			speed_now_mbs, speed_avg_mbs,
+			st->dedupe_attempts, st->matches_deduped,
+			pretty_size(st->bytes_deduped),
+			hrs, mins);
+	}
+	fflush(stderr);
+
+	st->last_progress_time = now;
+	st->bytes_scanned_at_last = st->bytes_scanned_total;
+	st->progress_active = true;
+}
+
 static int stream_blocks(const char *path, struct filerec *file_fr,
 			 uint64_t size, struct lookup_state *st)
 {
@@ -196,6 +306,14 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 	buf = malloc(buf_size);
 	if (buf == NULL)
 		return ENOMEM;
+
+	/*
+	 * Per-file progress reset. progress_active being false means
+	 * "no in-progress line has been emitted for THIS file yet" and
+	 * gates the final-emit at end-of-file. start_time and
+	 * bytes_scanned_total are corpus-wide and not reset here.
+	 */
+	st->progress_active = false;
 
 	qprintf("lookup: scanning \"%s\" (%s, file %"PRIu64")\n",
 		path, pretty_size(size),
@@ -398,7 +516,16 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 		sqlite3_reset(stmt);
 
 		off += advance;
+		st->bytes_scanned_total += advance;
+		print_progress(st, path, off, size, false);
 	}
+
+	/*
+	 * Commit the in-flight progress line (if any) with a \n so the
+	 * next file's qprintf "scanning" message on stdout does not
+	 * land on top of it.
+	 */
+	print_progress(st, path, off, size, true);
 
 	free(buf);
 	return 0;
@@ -677,6 +804,17 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	 * writes).
 	 */
 	st.next_synth_id = -1;
+
+	/*
+	 * Real-time progress baseline. start_time anchors elapsed and
+	 * average-throughput math; last_progress_time starts equal to
+	 * start_time so the very first iter's elapsed_since is ~0 and
+	 * the throttle correctly skips it (no spurious 0-data emit).
+	 * is_tty is decided once here so we don't re-isatty per emit.
+	 */
+	clock_gettime(CLOCK_MONOTONIC, &st.start_time);
+	st.last_progress_time = st.start_time;
+	st.is_tty = isatty(STDERR_FILENO);
 
 	/*
 	 * Prepare the per-block lookup statement. Keyed by digest
