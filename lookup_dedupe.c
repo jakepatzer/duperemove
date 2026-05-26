@@ -239,6 +239,30 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 			    coalesce_covered(ref_id, file_fr->fileid, off))
 				continue;
 
+			/*
+			 * Same-file gap pre-check. For a within-file
+			 * match, the dedupe range cannot exceed the
+			 * gap between source and destination offsets
+			 * (the existing same-file overlap cap below
+			 * enforces this after extend_match). If that
+			 * gap is already smaller than --min-dedupe-size
+			 * the match cannot possibly qualify, so skip
+			 * it now and avoid paying extend_match's
+			 * random-seek cost on the ref_loff side. The
+			 * formula matches the post-extend cap exactly
+			 * so there is no risk of accepting a match here
+			 * that the post-cap would have rejected (or
+			 * vice versa). Only ref_id is needed - filerec
+			 * is not yet resolved, which is the point.
+			 */
+			if (options.min_dedupe_size &&
+			    ref_id == file_fr->fileid) {
+				uint64_t gap = (ref_loff > off) ?
+					(ref_loff - off) : (off - ref_loff);
+				if (gap < options.min_dedupe_size)
+					continue;
+			}
+
 			ref = filerec_find(ref_id);
 			if (ref == NULL) {
 				if (dbfile_load_one_filerec(st->db, ref_id,
