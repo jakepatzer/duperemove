@@ -766,6 +766,30 @@ struct dbhandle *dbfile_open_handle_readonly(char *filename)
 		goto err;
 	}
 
+	/*
+	 * Memory-map the hashfile. SQLite reads then come via
+	 * demand-loaded memory accesses (no pread syscall, no copy
+	 * from page cache to SQLite cache) which is a measurable win
+	 * for the random-access pattern of idx_blocks_digest lookups
+	 * during --lookup-only. 100 GB is sized to cover the current
+	 * production hashfile (~95 GB); on x64 Linux this only
+	 * reserves address space, it does not pin physical RAM - the
+	 * kernel pages in on demand and evicts under pressure.
+	 *
+	 * Non-fatal on failure: SQLite transparently falls back to
+	 * pread per-file if mmap is unavailable or fails. We log the
+	 * failure for diagnosis but don't abort the open.
+	 */
+	ret = sqlite3_exec(result->db,
+			   "PRAGMA mmap_size = 100000000000",
+			   NULL, NULL, NULL);
+	if (ret) {
+		perror_sqlite(ret,
+			      "configuring database (mmap_size) - "
+			      "continuing without mmap");
+		ret = 0;	/* clear so we don't trip later checks */
+	}
+
 	ret = dbfile_get_config(result->db, &cfg);
 	if (ret) {
 		perror_sqlite(ret, "reading hashfile config");
