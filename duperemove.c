@@ -45,6 +45,7 @@
 #include "find_dupes.h"
 #include "run_dedupe.h"
 #include "lookup_dedupe.h"
+#include "h16_build.h"
 
 #include "opt.h"
 
@@ -53,6 +54,7 @@ unsigned int blocksize = DEFAULT_BLOCKSIZE;
 static int stdin_filelist = 0;
 static unsigned int list_only_opt = 0;
 static unsigned int rm_only_opt = 0;
+static unsigned int build_h16_index_opt = 0;
 struct dbfile_config dbfile_cfg;
 
 static enum {
@@ -210,6 +212,7 @@ enum {
 	DEDUPE_TARGET_PRIORITY_OPTION,
 	LOOKUP_ONLY_OPTION,
 	LOOKUP_SELF_OPTION,
+	BUILD_H16_INDEX_OPTION,
 };
 
 static int process_fdupes(void)
@@ -328,6 +331,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		  DEDUPE_TARGET_PRIORITY_OPTION },
 		{ "lookup-only", 0, NULL, LOOKUP_ONLY_OPTION },
 		{ "lookup-self", 0, NULL, LOOKUP_SELF_OPTION },
+		{ "build-h16-index", 0, NULL, BUILD_H16_INDEX_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -443,6 +447,9 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		case LOOKUP_SELF_OPTION:
 			options.lookup_self = true;
 			break;
+		case BUILD_H16_INDEX_OPTION:
+			build_h16_index_opt = 1;
+			break;
 		case HELP_OPTION:
 			help();
 			break;
@@ -488,6 +495,36 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	if (options.lookup_self && !options.lookup_only) {
 		eprintf("Error: --lookup-self requires --lookup-only.\n");
 		return EINVAL;
+	}
+
+	if (build_h16_index_opt) {
+		if (options.hashfile == NULL) {
+			eprintf("Error: --build-h16-index requires "
+				"--hashfile.\n");
+			return EINVAL;
+		}
+		if (options.lookup_only || options.fdupes_mode ||
+		    list_only_opt || rm_only_opt) {
+			eprintf("Error: --build-h16-index is a standalone "
+				"operation; it cannot be combined with "
+				"--lookup-only, --fdupes, -L, or -R.\n");
+			return EINVAL;
+		}
+		if (write_hashes || read_hashes) {
+			eprintf("Error: --build-h16-index is incompatible "
+				"with --write-hashes and --read-hashes. "
+				"Build h16 against an already-populated "
+				"hashfile (use --hashfile= to specify it).\n");
+			return EINVAL;
+		}
+		/*
+		 * --hashfile= sets update_hashes=true earlier in the
+		 * parse, which would normally route to the scan + dedupe
+		 * pipeline in main(). Clear it so we don't accidentally
+		 * follow that path; --build-h16-index is its own branch
+		 * in main() and takes precedence over use_hashfile.
+		 */
+		update_hashes = false;
 	}
 
 	/* Filter out option combinations that don't make sense. */
@@ -565,10 +602,15 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		}
 	}
 
-	if (!(options.fdupes_mode || list_only_opt)
+	if (!(options.fdupes_mode || list_only_opt || build_h16_index_opt)
 			&& numfiles == 0) {
 		eprintf("Error: a file list argument is required.\n");
 		return 1;
+	}
+
+	if (build_h16_index_opt && numfiles > 0) {
+		eprintf("Warning: --build-h16-index does not take a file "
+			"list argument; ignoring.\n");
 	}
 
 out_nofiles:
@@ -736,6 +778,29 @@ int main(int argc, char **argv)
 		return list_db_files(options.hashfile);
 	else if (rm_only_opt)
 		return rm_db_files(argc - filelist_idx, &argv[filelist_idx]);
+
+	if (build_h16_index_opt) {
+		/*
+		 * --build-h16-index is a standalone one-shot operation
+		 * that builds the secondary h16 lookup index on an
+		 * already-populated hashfile. Opens RW (the schema
+		 * migration in dbfile_prepare adds the new tables and
+		 * columns if they aren't already present) and exits
+		 * when the build completes or fails. Resumable: a
+		 * crashed or aborted build leaves blocks_h16 and
+		 * blocks_h16_build_progress in a consistent state and
+		 * a subsequent invocation picks up where the previous
+		 * one stopped.
+		 */
+		db = dbfile_open_handle(options.hashfile);
+		if (!db)
+			goto out;
+
+		dbfile_set_gdb(db);
+
+		ret = h16_build_index(db);
+		goto out;
+	}
 
 	if (options.lookup_only) {
 		/*

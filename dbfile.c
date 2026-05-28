@@ -154,6 +154,116 @@ static int dbfile_check(sqlite3 *db, struct dbfile_config *cfg)
 	return 0;
 }
 
+/*
+ * Idempotent column presence check via PRAGMA table_info.
+ * SQLite has no ALTER TABLE ... ADD COLUMN IF NOT EXISTS, so we query
+ * the schema directly. Returns 1 if present, 0 if absent, <0 on error.
+ */
+static int dbfile_column_present(sqlite3 *db, const char *table,
+				 const char *column)
+{
+	sqlite3_stmt *stmt = NULL;
+	char query[256];
+	int ret, found = 0;
+
+	snprintf(query, sizeof(query), "PRAGMA table_info(%s);", table);
+	ret = sqlite3_prepare_v2(db, query, -1, &stmt, NULL);
+	if (ret) {
+		perror_sqlite(ret, "preparing PRAGMA table_info");
+		return -1;
+	}
+
+	while ((ret = sqlite3_step(stmt)) == SQLITE_ROW) {
+		const char *name = (const char *)sqlite3_column_text(stmt, 1);
+		if (name && strcmp(name, column) == 0) {
+			found = 1;
+			break;
+		}
+	}
+
+	sqlite3_finalize(stmt);
+
+	if (ret != SQLITE_ROW && ret != SQLITE_DONE) {
+		perror_sqlite(ret, "stepping PRAGMA table_info");
+		return -1;
+	}
+
+	return found;
+}
+
+/*
+ * Idempotent migration of the blocks table to add the columns needed
+ * for the h16-based lookup pipeline:
+ *
+ *   srccount           - per-position cumulative reflink count, capped
+ *                        at --lookup-max-reflinks during dedupe.
+ *                        Default -1 means "not yet seeded"; lazy-seeded
+ *                        via LOGICAL_INO_V2 on first encounter as a
+ *                        canonical candidate.
+ *   alias_root_fileid  - canonical (fileid, loff) for this position's
+ *   alias_root_loff      physical extent. NULL means "this position is
+ *                        its own root" (no prior dedupe). Set after
+ *                        each successful FIDEDUPERANGE so future
+ *                        candidate iteration converges to the right
+ *                        srccount via path compression.
+ *
+ * SQLite ALTER TABLE ADD COLUMN does not support IF NOT EXISTS in the
+ * versions we target, so we probe with PRAGMA table_info first.
+ *
+ * Runs from dbfile_prepare() on every RW open. The first run on an
+ * existing hashfile applies the migration; subsequent runs are pure
+ * PRAGMA checks (a few hundred microseconds total).
+ */
+static int dbfile_migrate_blocks_columns(sqlite3 *db)
+{
+	int ret;
+	int present;
+
+	present = dbfile_column_present(db, "blocks", "srccount");
+	if (present < 0)
+		return EIO;
+	if (!present) {
+		ret = sqlite3_exec(db,
+			"ALTER TABLE blocks ADD COLUMN "
+			"srccount INTEGER NOT NULL DEFAULT -1;",
+			NULL, NULL, NULL);
+		if (ret) {
+			perror_sqlite(ret, "adding blocks.srccount column");
+			return ret;
+		}
+	}
+
+	present = dbfile_column_present(db, "blocks", "alias_root_fileid");
+	if (present < 0)
+		return EIO;
+	if (!present) {
+		ret = sqlite3_exec(db,
+			"ALTER TABLE blocks ADD COLUMN "
+			"alias_root_fileid INTEGER;",
+			NULL, NULL, NULL);
+		if (ret) {
+			perror_sqlite(ret, "adding blocks.alias_root_fileid column");
+			return ret;
+		}
+	}
+
+	present = dbfile_column_present(db, "blocks", "alias_root_loff");
+	if (present < 0)
+		return EIO;
+	if (!present) {
+		ret = sqlite3_exec(db,
+			"ALTER TABLE blocks ADD COLUMN "
+			"alias_root_loff INTEGER;",
+			NULL, NULL, NULL);
+		if (ret) {
+			perror_sqlite(ret, "adding blocks.alias_root_loff column");
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
 static int create_tables(sqlite3 *db)
 {
 	int ret;
@@ -208,6 +318,52 @@ static int create_tables(sqlite3 *db)
 "fileid INTEGER, loff INTEGER, "					\
 "FOREIGN KEY(fileid) REFERENCES files(id) ON DELETE CASCADE);"
 	ret = sqlite3_exec(db, CREATE_TABLE_BLOCKS, NULL, NULL, NULL);
+	if (ret)
+		goto out;
+
+/*
+ * blocks_h16: secondary index for fast h16-based candidate lookups
+ * in --lookup-only mode. Each row represents a 16 KB rolling window
+ * starting at (fileid, loff); h16 is XXH128 of the four consecutive
+ * 4 KB block digests at loff, loff+blocksize, loff+2*blocksize, and
+ * loff+3*blocksize.
+ *
+ * The h16 hash guarantees a 16 KB byte match between any two positions
+ * sharing the same h16 value (modulo cryptographic XXH128 collision,
+ * negligible at any realistic scale). This eliminates the wasted
+ * extend_match cycles seen with the old 4 KB digest lookup, where most
+ * candidates extended only a few KB before failing the min_dedupe_size
+ * check.
+ *
+ * Built once via --build-h16-index after the regular Phase 1 scan.
+ */
+#define CREATE_TABLE_BLOCKS_H16						\
+"CREATE TABLE IF NOT EXISTS blocks_h16(h16 BLOB NOT NULL, "		\
+"fileid INTEGER NOT NULL, loff INTEGER NOT NULL, "			\
+"FOREIGN KEY(fileid) REFERENCES files(id) ON DELETE CASCADE);"
+	ret = sqlite3_exec(db, CREATE_TABLE_BLOCKS_H16, NULL, NULL, NULL);
+	if (ret)
+		goto out;
+
+/*
+ * blocks_h16_build_progress: per-fileid completion tracking for the
+ * h16 build. Each row records that all h16 entries for the given
+ * fileid have been inserted and committed. Allows the build to resume
+ * after a crash without re-processing already-completed files.
+ *
+ * Populated atomically with the per-fileid INSERT batch inside one
+ * transaction, so a row is present iff the fileid's h16 entries are
+ * durable in the WAL.
+ */
+#define CREATE_TABLE_BLOCKS_H16_PROGRESS				\
+"CREATE TABLE IF NOT EXISTS blocks_h16_build_progress("			\
+"fileid INTEGER PRIMARY KEY, "						\
+"completed_at INTEGER NOT NULL, "					\
+"FOREIGN KEY(fileid) REFERENCES files(id) ON DELETE CASCADE);"
+	ret = sqlite3_exec(db, CREATE_TABLE_BLOCKS_H16_PROGRESS,
+			   NULL, NULL, NULL);
+	if (ret)
+		goto out;
 
 out:
 	if (ret)
@@ -265,6 +421,23 @@ static int create_indexes(sqlite3 *db)
 #define CREATE_FILES_DIGEST_SIZE_INDEX					\
 "create index if not exists idx_files_digest_size on files(digest, size);"
 	ret = sqlite3_exec(db, CREATE_FILES_DIGEST_SIZE_INDEX, NULL, NULL, NULL);
+	if (ret)
+		goto out;
+
+	/*
+	 * idx_blocks_h16 is the covering lookup index for --lookup-only
+	 * h16 queries. (h16, fileid, loff) order means a `WHERE h16 = ?`
+	 * lookup is an index-only scan returning candidates in (fileid,
+	 * loff) order without any blocks_h16 table reads.
+	 *
+	 * Created here so the index is present on every open of an
+	 * already-migrated hashfile. The actual blocks_h16 rows are
+	 * populated by --build-h16-index, which is a separate one-shot
+	 * operation; this CREATE INDEX is a no-op on an empty table.
+	 */
+#define CREATE_BLOCKS_H16_INDEX						\
+"create index if not exists idx_blocks_h16 on blocks_h16(h16, fileid, loff);"
+	ret = sqlite3_exec(db, CREATE_BLOCKS_H16_INDEX, NULL, NULL, NULL);
 	if (ret)
 		goto out;
 
@@ -415,6 +588,19 @@ static int dbfile_prepare(sqlite3 *db)
 	ret = create_indexes(db);
 	if (ret) {
 		perror_sqlite(ret, "creating indexes");
+		return ret;
+	}
+
+	/*
+	 * Add the h16-pipeline columns to blocks (srccount,
+	 * alias_root_fileid, alias_root_loff) if not already present.
+	 * Idempotent: subsequent opens hit only the PRAGMA table_info
+	 * probe. First open on an existing hashfile runs the actual
+	 * ALTER TABLE statements.
+	 */
+	ret = dbfile_migrate_blocks_columns(db);
+	if (ret) {
+		perror_sqlite(ret, "migrating blocks columns");
 		return ret;
 	}
 
