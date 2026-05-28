@@ -52,6 +52,7 @@
 #include <unistd.h>
 
 #include <sqlite3.h>
+#include <glib.h>
 
 #include "csum.h"
 #include "dbfile.h"
@@ -333,6 +334,7 @@ int h16_build_index(struct dbhandle *db)
 	uint64_t rows_total = 0;
 	struct timespec start_ts, last_progress_ts;
 	bool aborted_low_disk = false;
+	GArray *todo = NULL;	/* materialized fileid list; freed at out: */
 
 	ret = dbfile_get_config(sdb, &cfg);
 	if (ret) {
@@ -459,8 +461,49 @@ int h16_build_index(struct dbhandle *db)
 		cfg.blocksize, H16_WINDOW_BLOCKS,
 		(cfg.blocksize * H16_WINDOW_BLOCKS) / 1024);
 
+	/*
+	 * Materialize the fileid list into an in-memory array BEFORE
+	 * the per-file work begins. The previous design held the
+	 * list_stmt cursor open across the entire loop, which kept a
+	 * shared lock on `files` and caused PRAGMA wal_checkpoint to
+	 * return SQLITE_LOCKED (table is locked) from the periodic
+	 * checkpoint call below. Failed checkpoints leave the WAL
+	 * growing unbounded - especially noticeable once the build
+	 * moves to many small files where each fileid's commit is
+	 * tiny but the checkpoint cadence becomes very frequent.
+	 *
+	 * Materializing the list closes the cursor before we enter
+	 * the processing loop, so subsequent PRAGMA wal_checkpoint
+	 * calls have no shared-lock conflict and the WAL gets
+	 * truncated as expected. Memory cost is trivial:
+	 * sizeof(int64_t) * total_files = 8 bytes per file. Even at
+	 * hundreds of thousands of files this is just a few MB.
+	 */
+	todo = g_array_new(FALSE, FALSE, sizeof(int64_t));
+	if (todo == NULL) {
+		eprintf("h16 build: out of memory allocating fileid list\n");
+		ret = ENOMEM;
+		goto out;
+	}
 	while ((rc = sqlite3_step(list_stmt)) == SQLITE_ROW) {
-		int64_t fileid = sqlite3_column_int64(list_stmt, 0);
+		int64_t fid = sqlite3_column_int64(list_stmt, 0);
+		g_array_append_val(todo, fid);
+	}
+	if (rc != SQLITE_DONE) {
+		perror_sqlite(rc, "h16 build: materializing fileid list");
+		ret = EIO;
+		goto out;
+	}
+	/*
+	 * Finalize the cursor early so its shared lock on `files` is
+	 * released before any wal_checkpoint runs. (The out: label
+	 * also finalizes if we exit via error, idempotently.)
+	 */
+	sqlite3_finalize(list_stmt);
+	list_stmt = NULL;
+
+	for (guint i = 0; i < todo->len; i++) {
+		int64_t fileid = g_array_index(todo, int64_t, i);
 		uint64_t inserted = 0;
 
 		ret = h16_build_one_fileid(sdb, fileid, cfg.blocksize,
@@ -528,11 +571,8 @@ int h16_build_index(struct dbhandle *db)
 		}
 	}
 
-	if (rc != SQLITE_DONE) {
-		perror_sqlite(rc, "h16 build: stepping fileid list");
-		ret = EIO;
-		goto out;
-	}
+	g_array_free(todo, TRUE);
+	todo = NULL;
 
 	/*
 	 * Rebuild idx_blocks_h16 now that all rows are in. This is
@@ -598,6 +638,8 @@ out:
 		sqlite3_finalize(insert_stmt);
 	if (progress_stmt)
 		sqlite3_finalize(progress_stmt);
+	if (todo)
+		g_array_free(todo, TRUE);
 
 	if (aborted_low_disk)
 		return ENOSPC;
