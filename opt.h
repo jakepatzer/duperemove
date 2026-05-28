@@ -62,6 +62,29 @@ struct options {
 	 * are kept.
 	 */
 	bool lookup_self : 1;
+
+	/*
+	 * Cap on reflinks added to any single canonical position by
+	 * --lookup-only during a run. When a candidate's canonical
+	 * srccount reaches this value the candidate is skipped and
+	 * we try the next h16 hit ("cap-aware spillover"). Prevents
+	 * accumulating thousands of reflinks on a single physical
+	 * extent, which on btrfs causes pathological metadata growth
+	 * and (on older kernels) performance cliffs.
+	 *
+	 * Set with --lookup-max-reflinks=N (default 500).
+	 */
+	uint32_t lookup_max_reflinks;
+
+	/*
+	 * --no-seed-srccount: disable the lazy LOGICAL_INO_V2 seed
+	 * pass that initializes srccount from kernel-truth on first
+	 * use of a canonical position. Useful for "pristine" hashfiles
+	 * with no pre-existing reflinks (no rmlint, no snapshots, no
+	 * prior dedupe runs) where srccount starting at 0 is correct
+	 * and the LOGICAL_INO_V2 calls are pure overhead.
+	 */
+	bool no_seed_srccount : 1;
 };
 
 extern struct options options;

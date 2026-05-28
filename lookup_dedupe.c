@@ -30,6 +30,22 @@
 #include "rbtree.h"
 #include "list.h"
 #include "csum.h"
+
+/*
+ * Local mirror of the perror_sqlite macro from dbfile.c. See the
+ * matching comment in h16_build.c for the rationale (dbfile.c keeps
+ * its macro private to that translation unit so the header doesn't
+ * have to pull in <sys/syscall.h>).
+ */
+#if (SQLITE_VERSION_NUMBER < 3007015)
+#define perror_sqlite(_err, _why)					\
+	eprintf("%s(): Database error %d while %s: %s\n",		\
+		__FUNCTION__, _err, _why, "[sqlite3_errstr() unavailable]")
+#else
+#define perror_sqlite(_err, _why)					\
+	eprintf("%s(): Database error %d while %s: %s\n",		\
+		__FUNCTION__, _err, _why, sqlite3_errstr(_err))
+#endif
 #include "filerec.h"
 #include "results-tree.h"
 #include "dedupe.h"
@@ -43,6 +59,8 @@
 #include "run_dedupe.h"
 
 #include "lookup_dedupe.h"
+#include "lookup_dedupe_internal.h"
+#include "srccount_seed.h"
 
 extern unsigned int blocksize;
 
@@ -50,42 +68,11 @@ extern unsigned int blocksize;
  * Lookup-mode run state. Single-threaded by construction (see header),
  * so no locking is required around these counters or the open_once.
  */
-struct lookup_state {
-	struct dbhandle	*db;
-	sqlite3_stmt	*find_block_stmt;
-	struct open_once ref_opens;
-	int64_t		next_synth_id;	/* counter for in-memory-only ids */
-	uint64_t	n_lookup_files;
-	uint64_t	n_ref_files;
-	uint64_t	matches_deduped;
-	uint64_t	bytes_deduped;
-	uint64_t	seed_matches_found;	/* db rows matched, before
-						 * any dedupe attempt */
-	uint64_t	dedupe_attempts;
-	uint64_t	n_too_small_skipped;	/* files skipped because
-						 * size < min_dedupe_size */
-	uint64_t	n_self_files;		/* reference files
-						 * stream-processed under
-						 * --lookup-self */
-
-	/*
-	 * Real-time progress tracking. Updated by stream_blocks; the
-	 * print is throttled to one emit per ~2 seconds in
-	 * print_progress(). bytes_scanned_total is the cumulative
-	 * outer-loop advance across all files; bytes_scanned_at_last
-	 * is the value at the previous emit (for short-window speed).
-	 * progress_active is per-file: set true on first emit during
-	 * the current file, reset to false at start of each new file
-	 * so we can decide whether to emit a final per-file summary
-	 * line.
-	 */
-	struct timespec	start_time;
-	struct timespec	last_progress_time;
-	uint64_t	bytes_scanned_total;
-	uint64_t	bytes_scanned_at_last;
-	int		is_tty;
-	bool		progress_active;
-};
+/*
+ * struct lookup_state moved to lookup_dedupe_internal.h so other
+ * helper translation units (e.g. srccount_seed.c) can access it
+ * without duplicating the type.
+ */
 
 static bool block_is_zero(const char *buf, size_t len)
 {
@@ -284,6 +271,150 @@ static void print_progress(struct lookup_state *st, const char *path,
 	st->last_progress_time = now;
 	st->bytes_scanned_at_last = st->bytes_scanned_total;
 	st->progress_active = true;
+}
+
+/*
+ * Resolve the canonical (fileid, loff) for a position via the
+ * alias_root_* columns, and return its srccount.
+ *
+ * The on-disk alias graph is kept at depth 1 by design: every
+ * dedupe operation writes the dst's alias_root to point to the
+ * FINAL canonical, not to an intermediate node. So one SELECT
+ * suffices to find the canonical, and a second SELECT fetches the
+ * canonical's srccount (when it differs from the input position).
+ *
+ * Returns 0 on success and fills *canon_fileid, *canon_loff,
+ * *canon_srccount. Returns ENOENT if the input position is not in
+ * the blocks table (which can happen for positions matching a
+ * zero-skip gap; treat as "no canonical, srccount unknown" by the
+ * caller). Returns EIO on a SQL error.
+ *
+ * srccount == -1 in the returned value is the "not seeded" sentinel
+ * - callers must treat -1 as "fresh, treat as 0 for cap purposes"
+ * (or, in Phase 5, run LOGICAL_INO_V2 to populate the real count).
+ */
+static int resolve_canonical(struct lookup_state *st,
+			     int64_t fileid, uint64_t loff,
+			     int64_t *canon_fileid, uint64_t *canon_loff,
+			     int64_t *canon_srccount)
+{
+	sqlite3_stmt *stmt = st->select_alias_root_stmt;
+	int rc;
+	int alias_type;
+	int64_t a_fileid;
+	int64_t a_loff;
+	int64_t srccount;
+
+	sqlite3_reset(stmt);
+	sqlite3_bind_int64(stmt, 1, fileid);
+	sqlite3_bind_int64(stmt, 2, (int64_t)loff);
+
+	rc = sqlite3_step(stmt);
+	if (rc == SQLITE_DONE) {
+		/*
+		 * Position not in blocks table. This happens for
+		 * transient (negative-fileid) destinations, and could
+		 * also happen for zero-skipped positions on the
+		 * candidate side if anything went wrong with Phase 1
+		 * scanning. Treat as "no canonical info".
+		 */
+		return ENOENT;
+	}
+	if (rc != SQLITE_ROW) {
+		perror_sqlite(rc, "lookup: stepping alias_root select");
+		return EIO;
+	}
+
+	alias_type = sqlite3_column_type(stmt, 0);
+	srccount = sqlite3_column_int64(stmt, 2);
+
+	if (alias_type == SQLITE_NULL) {
+		/* Position is its own canonical. */
+		*canon_fileid = fileid;
+		*canon_loff = loff;
+		*canon_srccount = srccount;
+		return 0;
+	}
+
+	a_fileid = sqlite3_column_int64(stmt, 0);
+	a_loff = sqlite3_column_int64(stmt, 1);
+
+	/* Need to fetch the canonical's srccount via a second SELECT. */
+	sqlite3_reset(st->select_srccount_stmt);
+	sqlite3_bind_int64(st->select_srccount_stmt, 1, a_fileid);
+	sqlite3_bind_int64(st->select_srccount_stmt, 2, a_loff);
+
+	rc = sqlite3_step(st->select_srccount_stmt);
+	if (rc == SQLITE_DONE) {
+		/*
+		 * Dangling alias pointer - the canonical row was
+		 * removed but this position still points to it. Should
+		 * not happen in a healthy hashfile (we never delete
+		 * blocks rows during --lookup-only), but tolerate it
+		 * by treating as own canonical.
+		 */
+		*canon_fileid = fileid;
+		*canon_loff = loff;
+		*canon_srccount = srccount;
+		return 0;
+	}
+	if (rc != SQLITE_ROW) {
+		perror_sqlite(rc, "lookup: stepping srccount select");
+		return EIO;
+	}
+
+	*canon_fileid = a_fileid;
+	*canon_loff = a_loff;
+	*canon_srccount = sqlite3_column_int64(st->select_srccount_stmt, 0);
+	return 0;
+}
+
+/*
+ * Increment srccount on a (presumably canonical) position.
+ * Returns 0 on success, errno on failure.
+ */
+static int inc_srccount_at(struct lookup_state *st,
+			   int64_t fileid, uint64_t loff)
+{
+	sqlite3_stmt *stmt = st->inc_srccount_stmt;
+	int rc;
+
+	sqlite3_reset(stmt);
+	sqlite3_bind_int64(stmt, 1, fileid);
+	sqlite3_bind_int64(stmt, 2, (int64_t)loff);
+
+	rc = sqlite3_step(stmt);
+	if (rc != SQLITE_DONE) {
+		perror_sqlite(rc, "lookup: stepping inc_srccount");
+		return EIO;
+	}
+	return 0;
+}
+
+/*
+ * Set alias_root at (fileid, loff) to point to (canon_fileid,
+ * canon_loff). For Phase 1 lookup-self only (fileid > 0); the
+ * caller is responsible for that gate.
+ */
+static int set_alias_root_at(struct lookup_state *st,
+			     int64_t fileid, uint64_t loff,
+			     int64_t canon_fileid, uint64_t canon_loff)
+{
+	sqlite3_stmt *stmt = st->set_alias_root_stmt;
+	int rc;
+
+	sqlite3_reset(stmt);
+	sqlite3_bind_int64(stmt, 1, fileid);
+	sqlite3_bind_int64(stmt, 2, (int64_t)loff);
+	sqlite3_bind_int64(stmt, 3, canon_fileid);
+	sqlite3_bind_int64(stmt, 4, (int64_t)canon_loff);
+
+	rc = sqlite3_step(stmt);
+	if (rc != SQLITE_DONE) {
+		perror_sqlite(rc, "lookup: stepping set_alias_root");
+		return EIO;
+	}
+	return 0;
 }
 
 static int stream_blocks(const char *path, struct filerec *file_fr,
@@ -511,6 +642,124 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 					continue;
 			}
 
+			/*
+			 * Phase 4: resolve candidate's canonical (via
+			 * alias_root_*) and skip if its srccount is at
+			 * the cap. This is the "cap-aware spillover"
+			 * mechanism that prevents accumulating thousands
+			 * of reflinks on any single physical extent.
+			 * Saturated candidates are skipped, the inner
+			 * loop continues to the next sqlite3_step row,
+			 * which is the next h16 hit in (fileid, loff)
+			 * order. Over a long run this naturally
+			 * distributes reflink load across all available
+			 * candidates without ever exceeding the cap on
+			 * any one.
+			 *
+			 * srccount == -1 is the "not yet seeded" sentinel
+			 * (Phase 5 lazy LOGICAL_INO_V2 seed will populate
+			 * it from kernel truth on first use). Until
+			 * Phase 5 lands we treat -1 as 0 here, which is
+			 * correct for hashfiles that have never been
+			 * rmlinted or snapshotted.
+			 */
+			int64_t canon_fileid = ref_id;
+			uint64_t canon_loff = ref_loff;
+			int64_t canon_srccount = -1;
+			{
+				int r = resolve_canonical(st, ref_id,
+							  ref_loff,
+							  &canon_fileid,
+							  &canon_loff,
+							  &canon_srccount);
+				if (r == EIO) {
+					/* SQL failure: bail on this seed. */
+					break;
+				}
+				/* r == ENOENT means candidate not in
+				 * blocks; treat as own canonical with
+				 * unknown srccount (treated as 0). */
+			}
+
+			/*
+			 * Phase 5: if the canonical's srccount is the
+			 * "not seeded" sentinel (-1), ask the kernel
+			 * for the real reflink count via
+			 * LOGICAL_INO_V2 and persist it back to the
+			 * row. Subsequent hits on this canonical see
+			 * the cached value with no kernel call.
+			 *
+			 * The seed call only happens on canonicals we
+			 * actually consider as candidates - positions
+			 * never matched by an h16 lookup never get
+			 * seeded, which is exactly what we want
+			 * (positions that aren't candidates can't
+			 * accumulate reflinks from us).
+			 *
+			 * --no-seed-srccount disables this; the cap
+			 * check then treats -1 as 0 and counts only
+			 * the reflinks we add ourselves.
+			 */
+			if (!options.no_seed_srccount &&
+			    canon_srccount < 0) {
+				int64_t seeded = 0;
+				int sr = srccount_lazy_seed(st,
+						canon_fileid, canon_loff,
+						options.lookup_max_reflinks,
+						&seeded);
+				if (sr == 0) {
+					canon_srccount = seeded;
+					st->srccount_seeded++;
+				}
+				/* On failure we keep canon_srccount at
+				 * -1 and treat as 0 below; the cap is
+				 * still enforced for OUR adds. */
+			}
+
+			{
+				int64_t cap = (int64_t)options.lookup_max_reflinks;
+				int64_t effective = canon_srccount < 0 ?
+					0 : canon_srccount;
+				if (effective >= cap) {
+					st->cap_skipped++;
+					continue;
+				}
+			}
+
+			/*
+			 * Multi-pass safety. If file_fr (the dst) is in
+			 * the hashfile (positive fileid, --lookup-self
+			 * mode) and the dst's own canonical already
+			 * matches the candidate's canonical, then a
+			 * previous dedupe has already aliased them
+			 * together. Re-submitting FIDEDUPERANGE would
+			 * still succeed (the kernel sees matching bytes
+			 * because they share a physical extent) but
+			 * would falsely increment our srccount, causing
+			 * drift on multi-pass runs. Skip the candidate.
+			 */
+			if (file_fr->fileid > 0) {
+				int64_t dst_canon_fileid = file_fr->fileid;
+				uint64_t dst_canon_loff = off;
+				int64_t dst_canon_srccount = -1;
+				int r;
+
+				r = resolve_canonical(st, file_fr->fileid,
+						      off,
+						      &dst_canon_fileid,
+						      &dst_canon_loff,
+						      &dst_canon_srccount);
+				if (r == EIO) {
+					break;
+				}
+				if (r == 0 &&
+				    dst_canon_fileid == canon_fileid &&
+				    dst_canon_loff == canon_loff) {
+					st->alias_already_same++;
+					continue;
+				}
+			}
+
 			ref = filerec_find(ref_id);
 			if (ref == NULL) {
 				if (dbfile_load_one_filerec(st->db, ref_id,
@@ -576,6 +825,28 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 
 				st->matches_deduped++;
 				st->bytes_deduped += kern_bytes;
+
+				/*
+				 * Phase 4 bookkeeping. Increment
+				 * srccount on the canonical (the
+				 * physical extent we just added a
+				 * reflink to) and, if file_fr lives in
+				 * the hashfile, persist its alias_root
+				 * so subsequent passes know which
+				 * canonical it now references. The
+				 * UPDATEs are best-effort: a SQL
+				 * failure here would log but should not
+				 * abort the seed, since the kernel
+				 * reflink already exists.
+				 */
+				(void)inc_srccount_at(st, canon_fileid,
+						      canon_loff);
+				if (file_fr->fileid > 0) {
+					(void)set_alias_root_at(st,
+						file_fr->fileid, off,
+						canon_fileid,
+						canon_loff);
+				}
 
 				/*
 				 * High-water skip: advance past the
@@ -925,6 +1196,70 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	}
 
 	/*
+	 * Phase 4 statements. Each is keyed on (fileid, loff) and uses
+	 * the idx_blocks_fileid index. We deliberately keep them as
+	 * separate prepared statements rather than a single composite
+	 * query because the access pattern is sparse and conditional
+	 * (most candidates pass cap, alias updates only happen on
+	 * successful dedupes), and SQLite's prepared statement cache
+	 * for a small fixed set is dominant over query-planning cost
+	 * for ad-hoc composites.
+	 */
+	rc = sqlite3_prepare_v2(db->db,
+		"select alias_root_fileid, alias_root_loff, srccount "
+		"from blocks where fileid = ?1 and loff = ?2;",
+		-1, &st.select_alias_root_stmt, NULL);
+	if (rc) {
+		eprintf("lookup: preparing alias-root select: %s\n",
+			sqlite3_errstr(rc));
+		return EIO;
+	}
+
+	rc = sqlite3_prepare_v2(db->db,
+		"select srccount from blocks where fileid = ?1 and loff = ?2;",
+		-1, &st.select_srccount_stmt, NULL);
+	if (rc) {
+		eprintf("lookup: preparing srccount select: %s\n",
+			sqlite3_errstr(rc));
+		return EIO;
+	}
+
+	rc = sqlite3_prepare_v2(db->db,
+		"update blocks set srccount = srccount + 1 "
+		"where fileid = ?1 and loff = ?2;",
+		-1, &st.inc_srccount_stmt, NULL);
+	if (rc) {
+		eprintf("lookup: preparing srccount increment: %s\n",
+			sqlite3_errstr(rc));
+		return EIO;
+	}
+
+	rc = sqlite3_prepare_v2(db->db,
+		"update blocks set alias_root_fileid = ?3, "
+		"alias_root_loff = ?4 where fileid = ?1 and loff = ?2;",
+		-1, &st.set_alias_root_stmt, NULL);
+	if (rc) {
+		eprintf("lookup: preparing alias-root update: %s\n",
+			sqlite3_errstr(rc));
+		return EIO;
+	}
+
+	/*
+	 * Phase 5: set srccount to a specific value (used to transition
+	 * canonicals from -1 to the kernel-truth reflink count after a
+	 * successful LOGICAL_INO_V2 seed).
+	 */
+	rc = sqlite3_prepare_v2(db->db,
+		"update blocks set srccount = ?1 "
+		"where fileid = ?2 and loff = ?3;",
+		-1, &st.set_srccount_stmt, NULL);
+	if (rc) {
+		eprintf("lookup: preparing srccount-set update: %s\n",
+			sqlite3_errstr(rc));
+		return EIO;
+	}
+
+	/*
 	 * Initialize the coalesce high-water map even though our
 	 * streaming loop also performs a within-file high-water skip
 	 * by advancing the offset directly. coalesce_record() is
@@ -946,6 +1281,11 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 
 	filerec_close_open_list(&st.ref_opens);
 	sqlite3_finalize(st.find_block_stmt);
+	sqlite3_finalize(st.select_alias_root_stmt);
+	sqlite3_finalize(st.select_srccount_stmt);
+	sqlite3_finalize(st.inc_srccount_stmt);
+	sqlite3_finalize(st.set_alias_root_stmt);
+	sqlite3_finalize(st.set_srccount_stmt);
 	coalesce_map_destroy();
 
 	qprintf("lookup: %"PRIu64" lookup file(s) processed, "

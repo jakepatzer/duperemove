@@ -24,4 +24,6 @@ struct options options = {
 	.dedupe_same_file = true,
 	.batch_size = 1024,
 	.fdupes_mode = false,
+	.lookup_max_reflinks = 500,
+	.no_seed_srccount = false,
 };

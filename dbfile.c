@@ -930,8 +930,18 @@ struct dbhandle *dbfile_open_handle_readonly(char *filename)
 	if (result == NULL)
 		return NULL;
 
+	/*
+	 * Despite the historical "readonly" name, --lookup-only now
+	 * requires write access to maintain the srccount and
+	 * alias_root_* columns introduced in Phase 4. The hashfile
+	 * structure (blocks, blocks_h16, files, etc.) is still never
+	 * modified - only the per-position bookkeeping columns are
+	 * updated, and only via the specific prepared statements set
+	 * up below. No INSERT/DELETE on the bulk data tables ever
+	 * runs through this path.
+	 */
 	ret = sqlite3_open_v2(filename, &result->db,
-			      SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX |
+			      SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX |
 			      SQLITE_OPEN_URI, NULL);
 	if (ret) {
 		perror_sqlite_open(result->db, filename);
@@ -941,10 +951,22 @@ struct dbhandle *dbfile_open_handle_readonly(char *filename)
 	}
 
 	/*
-	 * Only set read-only-safe pragmas. PRAGMA journal_mode = WAL
-	 * and PRAGMA synchronous would attempt to mutate the database
-	 * file and are deliberately skipped.
+	 * --lookup-only now opens RW for srccount/alias_root
+	 * maintenance, so synchronous = OFF here matches the
+	 * full-RW path's tradeoff (small risk of losing the most
+	 * recent srccount UPDATEs on power loss; the lazy
+	 * LOGICAL_INO_V2 seed in Phase 5 catches the drift on the
+	 * next run). WAL mode is already a property of the file
+	 * from prior RW opens, so we do not need to re-establish it
+	 * here.
 	 */
+	ret = sqlite3_exec(result->db, "PRAGMA synchronous = OFF",
+			   NULL, NULL, NULL);
+	if (ret) {
+		perror_sqlite(ret, "configuring database (synchronous)");
+		goto err;
+	}
+
 	ret = sqlite3_exec(result->db, "PRAGMA cache_size = -256000",
 			   NULL, NULL, NULL);
 	if (ret) {

@@ -213,6 +213,8 @@ enum {
 	LOOKUP_ONLY_OPTION,
 	LOOKUP_SELF_OPTION,
 	BUILD_H16_INDEX_OPTION,
+	LOOKUP_MAX_REFLINKS_OPTION,
+	NO_SEED_SRCCOUNT_OPTION,
 };
 
 static int process_fdupes(void)
@@ -332,6 +334,8 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "lookup-only", 0, NULL, LOOKUP_ONLY_OPTION },
 		{ "lookup-self", 0, NULL, LOOKUP_SELF_OPTION },
 		{ "build-h16-index", 0, NULL, BUILD_H16_INDEX_OPTION },
+		{ "lookup-max-reflinks", 1, NULL, LOOKUP_MAX_REFLINKS_OPTION },
+		{ "no-seed-srccount", 0, NULL, NO_SEED_SRCCOUNT_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -449,6 +453,23 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			break;
 		case BUILD_H16_INDEX_OPTION:
 			build_h16_index_opt = 1;
+			break;
+		case LOOKUP_MAX_REFLINKS_OPTION: {
+			unsigned long v;
+			char *endp = NULL;
+			v = strtoul(optarg, &endp, 10);
+			if (endp == optarg || *endp != '\0' || v == 0 ||
+			    v > UINT32_MAX) {
+				eprintf("Error: --lookup-max-reflinks "
+					"must be a positive integer "
+					"(got \"%s\").\n", optarg);
+				return EINVAL;
+			}
+			options.lookup_max_reflinks = (uint32_t)v;
+			break;
+		}
+		case NO_SEED_SRCCOUNT_OPTION:
+			options.no_seed_srccount = true;
 			break;
 		case HELP_OPTION:
 			help();
