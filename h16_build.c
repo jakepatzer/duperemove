@@ -373,6 +373,37 @@ int h16_build_index(struct dbhandle *db)
 	}
 
 	/*
+	 * Bulk-load: drop idx_blocks_h16 before INSERTing, recreate
+	 * once at the end.
+	 *
+	 * h16 values are uniformly random (XXH128 of random digests),
+	 * so per-row index maintenance during INSERTs touches the
+	 * leaf B-tree pages in random order. Once the index outgrows
+	 * the SQLite page cache (a few GB on a multi-tens-of-GB
+	 * index), every insert becomes a random write to a different
+	 * leaf page - the cache thrash pattern that motivated the
+	 * existing dbfile_drop_bulk_load_indexes optimization for
+	 * idx_blocks_digest. Same fix applies here.
+	 *
+	 * Re-creating the index at the end is a single sequential
+	 * sort-and-build pass which is dramatically faster on
+	 * already-populated data than maintaining the index per-row.
+	 *
+	 * Resumability interaction: if we crash mid-build, the next
+	 * dbfile_prepare() will recreate idx_blocks_h16 (via
+	 * create_indexes()) on whatever partial data is present.
+	 * That's wasted work, but a subsequent --build-h16-index
+	 * resume will simply drop it again at this point and
+	 * continue. The end-state correctness is preserved.
+	 */
+	ret = sqlite3_exec(sdb, "DROP INDEX IF EXISTS idx_blocks_h16;",
+			   NULL, NULL, NULL);
+	if (ret) {
+		perror_sqlite(ret, "h16 build: dropping idx_blocks_h16");
+		return EIO;
+	}
+
+	/*
 	 * List of fileids that still need to be processed. We
 	 * deliberately compute this once up front (rather than
 	 * re-querying after each commit), since the list is bounded
@@ -501,6 +532,37 @@ int h16_build_index(struct dbhandle *db)
 		perror_sqlite(rc, "h16 build: stepping fileid list");
 		ret = EIO;
 		goto out;
+	}
+
+	/*
+	 * Rebuild idx_blocks_h16 now that all rows are in. This is
+	 * the matching half of the bulk-load drop above. CREATE INDEX
+	 * sorts the table once and writes the leaf pages in order,
+	 * which is dramatically faster than maintaining the index
+	 * per-row during INSERT for a uniformly-random key column.
+	 */
+	{
+		struct timespec idx_start, idx_end;
+		double idx_dt;
+
+		qprintf("h16 build: rebuilding idx_blocks_h16 covering "
+			"index (sort + write); this may take a while...\n");
+		clock_gettime(CLOCK_MONOTONIC, &idx_start);
+		ret = sqlite3_exec(sdb,
+			"CREATE INDEX IF NOT EXISTS idx_blocks_h16 "
+			"ON blocks_h16(h16, fileid, loff);",
+			NULL, NULL, NULL);
+		if (ret) {
+			perror_sqlite(ret,
+				"h16 build: rebuilding idx_blocks_h16");
+			ret = EIO;
+			goto out;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &idx_end);
+		idx_dt = (idx_end.tv_sec - idx_start.tv_sec) +
+			 (idx_end.tv_nsec - idx_start.tv_nsec) / 1e9;
+		qprintf("h16 build: idx_blocks_h16 rebuilt in %.1f min\n",
+			idx_dt / 60.0);
 	}
 
 	/* Final checkpoint to flush any remaining WAL into the main DB. */
