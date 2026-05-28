@@ -293,30 +293,38 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 	sqlite3_stmt *stmt = st->find_block_stmt;
 	uint64_t off = 0;
 	/*
+	 * Seed window size for the h16 lookup. Each seed covers
+	 * 4 consecutive blocksize-byte ranges (the same 16 KB the
+	 * blocks_h16 build pass anchored each h16 row over). The
+	 * seed step itself stays at blocksize, so successive seeds
+	 * overlap by 3 blocks. This is the "scan at every blocksize
+	 * stride" semantics with the new 16 KB hash window.
+	 */
+	uint64_t window_bytes = (uint64_t)blocksize * 4;
+
+	/*
 	 * Outer-loop read buffering. The streaming scan walks the file
-	 * one block (typically 4 KiB) at a time, but issuing a
-	 * separate pread per block costs one syscall per block (~62.5 M
-	 * for a 250 GB file). Fold N consecutive blocks into one pread
-	 * of size LOOKUP_READ_BUF_SIZE; subsequent blocks are served
+	 * blocksize at a time, but issuing a separate pread per block
+	 * costs one syscall per block (~62.5 M for a 250 GB file at
+	 * 4 KB blocks). Fold N consecutive blocks into one pread of
+	 * size LOOKUP_READ_BUF_SIZE; subsequent blocks are served
 	 * from the in-process buffer instead. The kernel's page cache
-	 * already absorbs sequential 4 KiB preads, so this is a
-	 * syscall + buffer-management cost reduction, not a disk-I/O
-	 * reduction.
+	 * already absorbs sequential preads, so this is a syscall +
+	 * buffer-management cost reduction, not a disk-I/O reduction.
 	 *
-	 * The buffer is refilled from `off` whenever the current block
-	 * is not entirely contained in it. That handles two cases
-	 * cleanly: (1) the normal block-by-block advance just falls
-	 * off the end of the current buffer after N blocks, and (2) a
-	 * successful dedupe causes `off` to jump forward by the
-	 * deduped range's length, which may skip past the buffer
-	 * entirely - we just discard and refill at the new `off`.
+	 * The buffer is refilled from `off` whenever the current
+	 * window (window_bytes starting at `off`) does not live
+	 * entirely within it. That handles (1) the normal blocksize
+	 * advance walking off the end after N iters, and (2) a
+	 * successful dedupe causing `off` to jump forward by the
+	 * deduped range's length, possibly past the buffer entirely.
 	 *
-	 * Buffer size must be >= blocksize. If the caller runs with a
-	 * blocksize larger than LOOKUP_READ_BUF_SIZE we size up
-	 * automatically rather than refusing; in that regime the
-	 * buffering degrades to one pread per block (the same as
-	 * before this change), which is correct but offers no
-	 * speedup.
+	 * Buffer size must be >= window_bytes (we need all 4 blocks
+	 * of the current seed window resident at the same time to
+	 * compute h16). If a future caller runs with blocksize *
+	 * 4 > LOOKUP_READ_BUF_SIZE we size up automatically; in that
+	 * regime the buffering degrades to one pread per window which
+	 * is correct but offers no syscall amortization.
 	 */
 #define LOOKUP_READ_BUF_SIZE (64 * 1024)
 	size_t buf_size = LOOKUP_READ_BUF_SIZE;
@@ -324,8 +332,8 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 	size_t buf_valid = 0;
 	int rc = 0;
 
-	if (buf_size < blocksize)
-		buf_size = blocksize;
+	if (buf_size < window_bytes)
+		buf_size = window_bytes;
 
 	buf = malloc(buf_size);
 	if (buf == NULL)
@@ -343,47 +351,56 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 		path, pretty_size(size),
 		st->n_lookup_files + st->n_self_files + 1);
 
-	while (off + blocksize <= size) {
-		unsigned char digest[DIGEST_LEN];
+	while (off + window_bytes <= size) {
+		unsigned char digests[4][DIGEST_LEN];
+		unsigned char h16[DIGEST_LEN];
+		unsigned char concat[4 * DIGEST_LEN];
 		uint64_t advance = blocksize;
-		char *block;
+		char *block0;
 
 		/*
-		 * Ensure the current block lives entirely within the
-		 * buffer. If the buffer is empty (first iteration),
-		 * exhausted (sequential advance walked off the end),
+		 * Ensure the current 16 KB seed window lives entirely
+		 * within the buffer. If the buffer is empty, exhausted,
 		 * or behind us (large advance after a successful
 		 * dedupe), refill from `off`. We never need to look
-		 * backward because the outer loop is monotonic in
-		 * `off`.
+		 * backward because the outer loop is monotonic in `off`.
 		 */
 		if (off < buf_file_off ||
-		    off + blocksize > buf_file_off + buf_valid) {
+		    off + window_bytes > buf_file_off + buf_valid) {
 			ssize_t rd;
 
 			buf_file_off = off;
 			rd = pread(file_fr->fd, buf, buf_size, off);
-			if (rd < (ssize_t)blocksize) {
+			if (rd < (ssize_t)window_bytes) {
 				if (rd < 0)
 					eprintf("lookup: pread \"%s\" @ "
 						"%"PRIu64": %s\n",
 						path, off, strerror(errno));
 				/*
 				 * Either a hard error or a short read
-				 * that can't form a full block - treat
-				 * as EOF and stop. The outer-loop guard
-				 * (off + blocksize <= size) normally
-				 * keeps us in-bounds, but the file may
-				 * have shrunk between scan and now.
+				 * that can't form a full seed window -
+				 * treat as EOF and stop. The outer-loop
+				 * guard (off + window_bytes <= size)
+				 * normally keeps us in-bounds, but the
+				 * file may have shrunk between scan and
+				 * now.
 				 */
 				break;
 			}
 			buf_valid = (size_t)rd;
 		}
 
-		block = buf + (off - buf_file_off);
+		block0 = buf + (off - buf_file_off);
 
-		if (options.skip_zeroes && block_is_zero(block, blocksize)) {
+		/*
+		 * Zero-skip is on the FIRST block of the seed window
+		 * only. The blocks_h16 build also skipped windows that
+		 * contained an interior zero-block gap, so windows
+		 * with a zero leading block could not have entries in
+		 * blocks_h16 anyway. Skipping at the seed side mirrors
+		 * the build-side semantics.
+		 */
+		if (options.skip_zeroes && block_is_zero(block0, blocksize)) {
 			off += blocksize;
 			/*
 			 * Zero-skip bypasses the bottom-of-loop
@@ -398,9 +415,28 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 			continue;
 		}
 
-		checksum_block(block, (int)blocksize, digest);
+		/*
+		 * Compute 4 block digests then h16 = XXH128 of their
+		 * concatenation. This matches the construction used by
+		 * h16_build_index() exactly so an image position whose
+		 * 16 KB content matches a corpus reference at any
+		 * blocksize-aligned position will produce the same h16
+		 * value.
+		 */
+		checksum_block(block0, (int)blocksize, digests[0]);
+		checksum_block(block0 + blocksize, (int)blocksize, digests[1]);
+		checksum_block(block0 + 2 * blocksize, (int)blocksize,
+			       digests[2]);
+		checksum_block(block0 + 3 * blocksize, (int)blocksize,
+			       digests[3]);
 
-		rc = sqlite3_bind_blob(stmt, 1, digest, DIGEST_LEN,
+		memcpy(concat,                     digests[0], DIGEST_LEN);
+		memcpy(concat +     DIGEST_LEN,    digests[1], DIGEST_LEN);
+		memcpy(concat + 2 * DIGEST_LEN,    digests[2], DIGEST_LEN);
+		memcpy(concat + 3 * DIGEST_LEN,    digests[3], DIGEST_LEN);
+		checksum_block((char *)concat, sizeof(concat), h16);
+
+		rc = sqlite3_bind_blob(stmt, 1, h16, DIGEST_LEN,
 				       SQLITE_STATIC);
 		if (rc) {
 			eprintf("lookup: sqlite3_bind_blob failed: %d\n", rc);
@@ -423,11 +459,11 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 
 			/*
 			 * Self-identity filter: same file AND same
-			 * logical offset is the block's own row in
-			 * the hashfile. For transient (negative)
+			 * logical offset is the seed's own row in
+			 * blocks_h16. For transient (negative)
 			 * fileids this never fires; for reference
 			 * files re-entering under --lookup-self this
-			 * is what prevents a block from "matching"
+			 * is what prevents a position from "matching"
 			 * itself.
 			 */
 			if (ref_id == file_fr->fileid && ref_loff == off)
@@ -495,11 +531,18 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 				continue;
 			}
 
-			ext_len = blocksize;
+			/*
+			 * h16 guarantees a 16 KB byte match, so start
+			 * extend_match with the full window already
+			 * matched - it just needs to extend forward
+			 * beyond the seed. Without --coalesce we
+			 * submit the bare 16 KB.
+			 */
+			ext_len = window_bytes;
 			if (options.coalesce)
 				ext_len = extend_match(ref, ref_loff,
 						       file_fr, off,
-						       blocksize);
+						       window_bytes);
 
 			/*
 			 * Same-file dedup safety: cap to the gap
@@ -539,8 +582,8 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 				 * range the kernel actually deduped.
 				 * Round down to blocksize to keep
 				 * subsequent seed offsets block-aligned
-				 * (otherwise their hashes cannot match
-				 * any block hash in the hashfile).
+				 * (otherwise their h16 values cannot
+				 * match any entry in blocks_h16).
 				 */
 				step = (kern_bytes / blocksize) * blocksize;
 				if (step >= blocksize)
@@ -852,18 +895,31 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	st.is_tty = isatty(STDERR_FILENO);
 
 	/*
-	 * Prepare the per-block lookup statement. Keyed by digest
-	 * only; the idx_blocks_digest index makes this an O(log n)
-	 * lookup per call. We deliberately avoid joining files here:
-	 * the (fileid, loff) pair is enough to drive filerec_find /
-	 * dbfile_load_one_filerec lazily and skip the join cost on
-	 * every call.
+	 * Prepare the h16-based lookup statement. Keyed by the 16 KB
+	 * rolling-window hash; the covering idx_blocks_h16 index
+	 * makes this an O(log n) index-only scan, no blocks_h16
+	 * table reads needed. We deliberately avoid joining files
+	 * here: the (fileid, loff) pair is enough to drive
+	 * filerec_find / dbfile_load_one_filerec lazily and skip the
+	 * join cost on every call.
+	 *
+	 * The key insight that makes this much faster than the
+	 * previous per-block-digest lookup: every row this query
+	 * returns is guaranteed to be a 16 KB byte-match against the
+	 * seed (modulo cryptographic XXH128 collision, negligible at
+	 * any realistic scale). The old per-digest path returned
+	 * thousands of "candidates" per seed for hot 4 KB patterns,
+	 * most of which diverged within the first few KB of the
+	 * surrounding bytes; extend_match burned ~50-100 KB of disk
+	 * reads per candidate to discover this. With h16, every
+	 * candidate is already known to be a valid 16 KB match and
+	 * no wasted extend_match cycles happen.
 	 */
 	rc = sqlite3_prepare_v2(db->db,
-		"select fileid, loff from blocks where digest = ?1;",
+		"select fileid, loff from blocks_h16 where h16 = ?1;",
 		-1, &st.find_block_stmt, NULL);
 	if (rc) {
-		eprintf("lookup: preparing block-lookup statement: %s\n",
+		eprintf("lookup: preparing h16-lookup statement: %s\n",
 			sqlite3_errstr(rc));
 		return EIO;
 	}

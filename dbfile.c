@@ -995,16 +995,17 @@ struct dbhandle *dbfile_open_handle_readonly(char *filename)
 	}
 
 	/*
-	 * --lookup-only requires the digest index on the blocks table.
-	 * Without it every block lookup would be a full-table scan;
-	 * the hashfile would have to be billions of rows to be useful
-	 * here. Refuse rather than silently performing pathologically.
+	 * --lookup-only now matches at 16 KB-window granularity via
+	 * the blocks_h16 secondary index. Without idx_blocks_h16
+	 * every h16 lookup would be a full-table scan of blocks_h16,
+	 * which is the same row count as blocks. Refuse rather than
+	 * silently performing pathologically.
 	 */
-	ret = dbfile_check_index(result->db, "idx_blocks_digest");
+	ret = dbfile_check_index(result->db, "idx_blocks_h16");
 	if (ret == ENOENT) {
-		eprintf("Hashfile is missing index 'idx_blocks_digest'. "
-			"Rebuild it with a current duperemove "
-			"(hash phase always creates this index).\n");
+		eprintf("Hashfile is missing index 'idx_blocks_h16'. "
+			"Build it with: duperemove --build-h16-index "
+			"--hashfile=<hashfile>\n");
 		goto err;
 	}
 	if (ret) {
@@ -1013,44 +1014,45 @@ struct dbhandle *dbfile_open_handle_readonly(char *filename)
 	}
 
 	/*
-	 * --lookup-only matches per-block, against the 'blocks' table.
-	 * The default hash phase only populates the 'extents' table
-	 * (one hash per physical extent); per-block hashes are only
-	 * written when --dedupe-options=partial is used. An extent
-	 * hash would also be unusable here in practice, because the
-	 * extent boundaries of an extracted file have no reason to
-	 * align with extent boundaries inside its source image -- so
-	 * extent-based lookups would yield essentially zero matches.
-	 * Detect the misconfiguration up front and fail with a clear,
-	 * actionable error rather than silently dedupe nothing.
+	 * --lookup-only matches at 16 KB rolling-window granularity
+	 * against blocks_h16. That table is populated by
+	 * --build-h16-index, which itself requires the underlying
+	 * per-block hashes in `blocks` (populated by Phase 1 scan
+	 * with --dedupe-options=partial). A non-empty blocks_h16 is
+	 * the sufficient runtime precondition; if blocks_h16 is
+	 * empty the hashfile either has not been h16-indexed yet or
+	 * the Phase 1 blocks population was missing.
 	 */
 	{
 		_cleanup_(sqlite3_stmt_cleanup) sqlite3_stmt *bstmt = NULL;
 		int step;
 
 		ret = sqlite3_prepare_v2(result->db,
-			"select 1 from blocks limit 1;",
+			"select 1 from blocks_h16 limit 1;",
 			-1, &bstmt, NULL);
 		if (ret) {
-			perror_sqlite(ret, "preparing blocks-population check");
+			perror_sqlite(ret,
+				"preparing blocks_h16-population check");
 			goto err;
 		}
 		step = sqlite3_step(bstmt);
 		if (step == SQLITE_DONE) {
-			eprintf("Error: hashfile contains no per-block "
-				"hashes. --lookup-only matches at block "
-				"granularity and requires the hashfile to "
-				"have been built with "
-				"--dedupe-options=partial. Rebuild the "
-				"hashfile, for example:\n"
-				"  duperemove -rh --hashfile=<hashfile> "
-				"--dedupe-options=partial -b %u <images>\n",
+			eprintf("Error: hashfile contains no h16 "
+				"entries. --lookup-only matches via the "
+				"blocks_h16 secondary index, which must "
+				"first be populated by:\n"
+				"  duperemove --build-h16-index "
+				"--hashfile=<hashfile>\n"
+				"(The underlying blocks table also needs "
+				"per-block hashes - rebuild the hashfile "
+				"with --dedupe-options=partial -b %u if "
+				"it does not yet have them.)\n",
 				blocksize);
 			goto err;
 		}
 		if (step != SQLITE_ROW) {
 			perror_sqlite(step,
-				      "stepping blocks-population check");
+				      "stepping blocks_h16-population check");
 			goto err;
 		}
 	}
