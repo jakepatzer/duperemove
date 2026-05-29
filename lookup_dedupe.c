@@ -592,6 +592,56 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 		char *block0;
 
 		/*
+		 * Per-SEED dst-alias short-circuit. If file_fr is in
+		 * the hashfile (--lookup-self mode) and dst at `off`
+		 * already has a non-self alias_root, then this position
+		 * has already been deduped to SOME canonical and no
+		 * candidate-list iteration could help us:
+		 *
+		 *   - re-deduping to the same canonical is a no-op
+		 *     (caught by the per-candidate alias check below)
+		 *   - re-deduping to a different canonical is a
+		 *     reflink migration with no net space saved, and
+		 *     we explicitly suppress that
+		 *
+		 * Without this hoist we'd still arrive at "skip" for
+		 * every candidate in the inner loop, but only AFTER
+		 * paying 2 SQL queries per candidate (and a buffer
+		 * pread, an h16 compute, an h16 index scan). On a hot
+		 * seed with hundreds of thousands of h16 collisions
+		 * that's an effectively infinite loop - 100% CPU on
+		 * already-mmap'd index pages, zero syscalls, no
+		 * progress lines.
+		 *
+		 * Hoisting it here costs one SQL query per OUTER
+		 * iteration and skips the entire seed if dst is
+		 * aliased.
+		 */
+		if (file_fr->fileid > 0) {
+			int64_t dst_cf = file_fr->fileid;
+			uint64_t dst_cl = off;
+			int64_t dst_cs = -1;
+			int r;
+
+			r = resolve_canonical(st, file_fr->fileid, off,
+					      &dst_cf, &dst_cl, &dst_cs);
+			if (r == EIO) {
+				rc = EIO;
+				break;
+			}
+			if (r == 0 &&
+			    (dst_cf != file_fr->fileid ||
+			     dst_cl != off)) {
+				st->alias_already_same++;
+				off += blocksize;
+				st->bytes_scanned_total += blocksize;
+				print_progress(st, path, off, size, false);
+				maybe_checkpoint(st);
+				continue;
+			}
+		}
+
+		/*
 		 * Ensure the current 16 KB seed window lives entirely
 		 * within the buffer. If the buffer is empty, exhausted,
 		 * or behind us (large advance after a successful
