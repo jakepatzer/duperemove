@@ -592,30 +592,44 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 		char *block0;
 
 		/*
-		 * Per-SEED dst-alias short-circuit. If file_fr is in
-		 * the hashfile (--lookup-self mode) and dst at `off`
-		 * already has a non-self alias_root, then this position
-		 * has already been deduped to SOME canonical and no
-		 * candidate-list iteration could help us:
+		 * Per-SEED dst short-circuit. Skip the entire seed
+		 * (no h16, no candidate iteration) when dst has been
+		 * "settled" by a prior pass. Two settled states:
 		 *
-		 *   - re-deduping to the same canonical is a no-op
-		 *     (caught by the per-candidate alias check below)
-		 *   - re-deduping to a different canonical is a
-		 *     reflink migration with no net space saved, and
-		 *     we explicitly suppress that
+		 *  (1) ALIASED: dst's alias_root_* points to some other
+		 *      canonical. Re-deduping to the same canonical
+		 *      is a no-op; re-deduping to a different one
+		 *      would be a reflink migration that saves no
+		 *      space and inflates srccount on the new target
+		 *      (suppressed).
 		 *
-		 * Without this hoist we'd still arrive at "skip" for
-		 * every candidate in the inner loop, but only AFTER
-		 * paying 2 SQL queries per candidate (and a buffer
-		 * pread, an h16 compute, an h16 index scan). On a hot
-		 * seed with hundreds of thousands of h16 collisions
-		 * that's an effectively infinite loop - 100% CPU on
-		 * already-mmap'd index pages, zero syscalls, no
-		 * progress lines.
+		 *  (2) REAL CANONICAL: dst's alias_root_* is NULL but
+		 *      srccount > 0. This means dst has either been
+		 *      Phase-5-seeded (someone else's scan listed it
+		 *      as a candidate) OR has had reflinks added to
+		 *      it (inc_srccount fired when another position
+		 *      was deduped TO this one). In --lookup-self,
+		 *      each unique content has exactly one canonical
+		 *      position - the others alias to it. That
+		 *      canonical's srccount > 0 because the aliasees
+		 *      incremented it. Migrating it now to a different
+		 *      canonical would re-shuffle reflinks for zero
+		 *      space gain, plus dst's own aliasees would
+		 *      still chain through dst at depth 2, breaking
+		 *      the depth-1 invariant resolve_canonical relies
+		 *      on.
 		 *
-		 * Hoisting it here costs one SQL query per OUTER
-		 * iteration and skips the entire seed if dst is
-		 * aliased.
+		 * Truly fresh canonical positions (alias_root NULL and
+		 * srccount == -1) still proceed - they need to be
+		 * processed for the first time. For canonicals whose
+		 * content is unique in the corpus, the h16 lookup
+		 * returns no rows and the inner loop exits cheaply,
+		 * so the re-cost on these is bounded.
+		 *
+		 * Without this hoist a hot seed could iterate hundreds
+		 * of thousands of cached SQL queries inside the inner
+		 * loop with no syscalls, no progress lines, and the
+		 * outer loop never advances.
 		 */
 		if (file_fr->fileid > 0) {
 			int64_t dst_cf = file_fr->fileid;
@@ -630,8 +644,9 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 				break;
 			}
 			if (r == 0 &&
-			    (dst_cf != file_fr->fileid ||
-			     dst_cl != off)) {
+			    ((dst_cf != file_fr->fileid ||
+			      dst_cl != off) ||
+			     dst_cs > 1)) {
 				st->alias_already_same++;
 				off += blocksize;
 				st->bytes_scanned_total += blocksize;
