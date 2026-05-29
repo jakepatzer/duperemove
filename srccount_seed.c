@@ -48,6 +48,23 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+/*
+ * Some kernel uapi headers (including Synology's DSM 7 4.4-based
+ * tree) ship the legacy BTRFS_IOC_LOGICAL_INO but not the V2 macro
+ * added in upstream 4.15. Define both ourselves if missing so the
+ * code below compiles uniformly. Both ioctls use the same arg type
+ * (struct btrfs_ioctl_logical_ino_args); V2 just additionally honors
+ * the .flags and .reserved fields.
+ */
+#ifndef BTRFS_IOC_LOGICAL_INO
+#define BTRFS_IOC_LOGICAL_INO	_IOWR(BTRFS_IOCTL_MAGIC, 36, \
+				      struct btrfs_ioctl_logical_ino_args)
+#endif
+#ifndef BTRFS_IOC_LOGICAL_INO_V2
+#define BTRFS_IOC_LOGICAL_INO_V2 _IOWR(BTRFS_IOCTL_MAGIC, 59, \
+				       struct btrfs_ioctl_logical_ino_args)
+#endif
+
 #include <sqlite3.h>
 
 #include "csum.h"
@@ -156,11 +173,73 @@ int srccount_lazy_seed(struct lookup_state *st,
 	 * of offset - more work for the same answer for our purposes.
 	 */
 
-	ret = ioctl(ref->fd, BTRFS_IOC_LOGICAL_INO_V2, &args);
-	if (ret < 0) {
-		ret = errno;
-		free(container);
-		return ret;
+	/*
+	 * Kernel-version-aware dispatch. V2 (4.15+) is preferred
+	 * because it stops walking back-references when the buffer
+	 * fills, bounding worst-case ioctl cost. V1 (3.7+) walks all
+	 * parents regardless of buffer size and is slower on heavily
+	 * shared extents, but works on kernels too old for V2 (e.g.
+	 * Synology DSM 7's 4.4 base).
+	 *
+	 * We try V2 first per call until we see ENOTTY / EOPNOTSUPP,
+	 * then latch v2_unsupported = true for the rest of the
+	 * process so every subsequent call goes straight to V1 with
+	 * no wasted syscall. First failure of each kind is logged
+	 * once so the user can tell which path is active without
+	 * having to strace.
+	 */
+	{
+		static bool v2_unsupported = false;
+		static bool v2_unsupported_logged = false;
+		static bool first_real_error_logged = false;
+		bool tried_v2 = false;
+
+		if (!v2_unsupported) {
+			tried_v2 = true;
+			ret = ioctl(ref->fd, BTRFS_IOC_LOGICAL_INO_V2,
+				    &args);
+			if (ret < 0 && (errno == ENOTTY ||
+					errno == EOPNOTSUPP)) {
+				if (!v2_unsupported_logged) {
+					eprintf("lookup: LOGICAL_INO_V2 "
+						"not supported on this "
+						"kernel (errno=%d); falling "
+						"back to V1 for the rest of "
+						"this run\n", errno);
+					v2_unsupported_logged = true;
+				}
+				v2_unsupported = true;
+				/* Reset args; V2 may have written status
+				 * fields even on early failure. */
+				memset(&args, 0, sizeof(args));
+				args.logical = phys;
+				args.size = buf_size;
+				args.inodes = (uintptr_t)container;
+				memset(container, 0, buf_size);
+			}
+		}
+
+		if (v2_unsupported) {
+			ret = ioctl(ref->fd, BTRFS_IOC_LOGICAL_INO, &args);
+		}
+
+		if (ret < 0) {
+			ret = errno;
+			if (!first_real_error_logged) {
+				eprintf("lookup: LOGICAL_INO%s seed failed "
+					"(errno=%d: %s) for canonical "
+					"(%"PRId64", %"PRIu64") phys=%"PRIu64
+					"; further seed errors will be "
+					"silent\n",
+					tried_v2 && !v2_unsupported ?
+						"_V2" : " (V1)",
+					ret, strerror(ret),
+					canon_fileid, canon_loff, phys);
+				first_real_error_logged = true;
+			}
+			free(container);
+			return ret;
+		}
 	}
 
 	/*
