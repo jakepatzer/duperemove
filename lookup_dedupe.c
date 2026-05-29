@@ -747,7 +747,16 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 		 * cheap when throttled out.
 		 */
 		uint64_t cand_in_seed = 0;
-#define MAX_CAND_PER_SEED	((uint64_t)65536)
+/*
+ * Safety cap on per-seed candidate iterations. With the outer-loop
+ * dst-alias hoist, the realistic worst case for a single seed is
+ * a fresh-territory hot h16 where every candidate cap_skips - which
+ * still completes in seconds on cached data. 1M leaves massive
+ * headroom for legitimate content (common system binaries replicated
+ * across hundreds of master files) while still bounding runaway
+ * loops to a few seconds of CPU time at the heartbeat granularity.
+ */
+#define MAX_CAND_PER_SEED	((uint64_t)1000000)
 #define HEARTBEAT_EVERY_CAND	((uint64_t)1024)
 
 		while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
