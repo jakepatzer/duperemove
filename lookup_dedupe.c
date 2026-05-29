@@ -194,6 +194,41 @@ static void fmt_size_h(uint64_t size, char *str, size_t str_bytes)
 	snprintf(str, str_bytes, "%.1f%s", v, units[u]);
 }
 
+/*
+ * Periodic in-process WAL checkpoint. PASSIVE never blocks the
+ * caller; it drains as many WAL frames as it can without waiting
+ * on active readers/writers and returns immediately. On heavy
+ * --lookup-self workloads the per-dedupe srccount / alias_root_*
+ * UPDATEs accumulate ~170 MB of WAL per 1 GB scanned because every
+ * version of every modified page is appended; an unbounded WAL
+ * eats hashfile-FS free space at multiples of the actual progress
+ * rate. Throttled to once every CHECKPOINT_INTERVAL_SEC so the
+ * overhead is negligible (a few ms per minute).
+ *
+ * A SQLITE_LOCKED return is not an error here: it means a prepared
+ * statement in this process held a shared lock at the instant the
+ * pragma ran. The frames stay in the WAL and the next firing will
+ * drain them.
+ */
+#define CHECKPOINT_INTERVAL_SEC 30.0
+static void maybe_checkpoint(struct lookup_state *st)
+{
+	struct timespec now;
+	double elapsed;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	elapsed = (now.tv_sec - st->last_checkpoint_time.tv_sec) +
+		  (now.tv_nsec - st->last_checkpoint_time.tv_nsec) / 1e9;
+
+	if (elapsed < CHECKPOINT_INTERVAL_SEC)
+		return;
+
+	sqlite3_exec(st->db->db,
+		     "PRAGMA wal_checkpoint(PASSIVE);",
+		     NULL, NULL, NULL);
+	st->last_checkpoint_time = now;
+}
+
 static void print_progress(struct lookup_state *st, const char *path,
 			   uint64_t off, uint64_t size, bool final)
 {
@@ -889,6 +924,7 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 		off += advance;
 		st->bytes_scanned_total += advance;
 		print_progress(st, path, off, size, false);
+		maybe_checkpoint(st);
 	}
 
 	/*
@@ -1185,6 +1221,7 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	 */
 	clock_gettime(CLOCK_MONOTONIC, &st.start_time);
 	st.last_progress_time = st.start_time;
+	st.last_checkpoint_time = st.start_time;
 	st.is_tty = isatty(STDERR_FILENO);
 
 	/*

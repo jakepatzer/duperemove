@@ -66,6 +66,16 @@ struct lookup_state {
 
 	struct timespec	start_time;
 	struct timespec	last_progress_time;
+	/*
+	 * Periodic in-process WAL checkpoint. UPDATEs to blocks
+	 * (srccount + alias_root_*) accumulate every-version page
+	 * frames in the WAL until something forces a checkpoint;
+	 * without this throttle the WAL grows ~170 MB per 1 GB
+	 * scanned on heavy --lookup-self workloads. PRAGMA
+	 * wal_checkpoint(PASSIVE) collapses each modified page to its
+	 * final version in the main DB and frees the WAL frames.
+	 */
+	struct timespec	last_checkpoint_time;
 	uint64_t	bytes_scanned_total;
 	uint64_t	bytes_scanned_at_last;
 	int		is_tty;
