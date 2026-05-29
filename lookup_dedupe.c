@@ -829,16 +829,29 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 			}
 
 			/*
-			 * Multi-pass safety. If file_fr (the dst) is in
-			 * the hashfile (positive fileid, --lookup-self
-			 * mode) and the dst's own canonical already
-			 * matches the candidate's canonical, then a
-			 * previous dedupe has already aliased them
-			 * together. Re-submitting FIDEDUPERANGE would
-			 * still succeed (the kernel sees matching bytes
-			 * because they share a physical extent) but
-			 * would falsely increment our srccount, causing
-			 * drift on multi-pass runs. Skip the candidate.
+			 * Multi-pass safety + reflink-migration suppression.
+			 * If file_fr (the dst) is in the hashfile (positive
+			 * fileid, --lookup-self mode) and the dst has ANY
+			 * non-self alias_root, then a previous dedupe has
+			 * already pointed this position at SOME canonical's
+			 * physical extent. Re-deduping it against a
+			 * different canonical here would migrate the
+			 * reflink from old-canonical to new-canonical
+			 * without freeing any new bytes (dst is already
+			 * sharing storage with someone) AND would corrupt
+			 * the cap accounting two ways: it would
+			 * over-increment new-canonical's srccount while
+			 * leaving old-canonical's srccount stale-high
+			 * (we never decrement, so old-canonical's apparent
+			 * reflink count grows above its kernel-truth count
+			 * and trips cap_skip on candidates that should
+			 * still fit).
+			 *
+			 * resolve_canonical returns (file_fr->fileid, off)
+			 * unchanged when alias_root is NULL, so the
+			 * "dst is its own canonical" case is the only one
+			 * where we proceed - i.e., dst has never been
+			 * deduped before.
 			 */
 			if (file_fr->fileid > 0) {
 				int64_t dst_canon_fileid = file_fr->fileid;
@@ -855,8 +868,8 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 					break;
 				}
 				if (r == 0 &&
-				    dst_canon_fileid == canon_fileid &&
-				    dst_canon_loff == canon_loff) {
+				    (dst_canon_fileid != file_fr->fileid ||
+				     dst_canon_loff != off)) {
 					st->alias_already_same++;
 					continue;
 				}
