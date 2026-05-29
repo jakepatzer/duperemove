@@ -237,11 +237,27 @@ static void print_progress(struct lookup_state *st, const char *path,
 
 	fmt_size_h(st->bytes_deduped, deduped_buf, sizeof(deduped_buf));
 
+	/*
+	 * Phase 4/5 visibility on the live progress line:
+	 *   cap_skip  - candidates skipped because canonical srccount
+	 *               already at --lookup-max-reflinks.
+	 *   alias     - candidates skipped because dst is already
+	 *               aliased to this canonical (multi-pass safety).
+	 *   seed      - canonicals where the lazy LOGICAL_INO_V2 seed
+	 *               fired (cumulative across the run, monotonic).
+	 *
+	 * These follow the cand/attempts/ok block so they read in the
+	 * natural order: how many we considered, how many we tried,
+	 * how many succeeded, and the three categories of "skipped"
+	 * that are specific to the Phase 4/5 machinery.
+	 */
 	if (st->is_tty && !final) {
 		fprintf(stderr,
 			"[lookup] file %"PRIu64" \"%s\" %5.1f%% | "
 			"%5.0f MB/s now %5.0f avg | "
 			"cand %"PRIu64" attempts %"PRIu64" ok %"PRIu64" | "
+			"cap_skip %"PRIu64" alias %"PRIu64
+			" seed %"PRIu64" | "
 			"deduped %s | %dh%02dm\033[K\r",
 			st->n_lookup_files + st->n_self_files + 1,
 			name,
@@ -249,6 +265,8 @@ static void print_progress(struct lookup_state *st, const char *path,
 			speed_now_mbs, speed_avg_mbs,
 			st->seed_matches_found,
 			st->dedupe_attempts, st->matches_deduped,
+			st->cap_skipped, st->alias_already_same,
+			st->srccount_seeded,
 			deduped_buf,
 			hrs, mins);
 	} else {
@@ -256,6 +274,8 @@ static void print_progress(struct lookup_state *st, const char *path,
 			"[lookup] file %"PRIu64" \"%s\" %5.1f%% | "
 			"%5.0f MB/s now %5.0f avg | "
 			"cand %"PRIu64" attempts %"PRIu64" ok %"PRIu64" | "
+			"cap_skip %"PRIu64" alias %"PRIu64
+			" seed %"PRIu64" | "
 			"deduped %s | %dh%02dm\n",
 			st->n_lookup_files + st->n_self_files + 1,
 			name,
@@ -263,6 +283,8 @@ static void print_progress(struct lookup_state *st, const char *path,
 			speed_now_mbs, speed_avg_mbs,
 			st->seed_matches_found,
 			st->dedupe_attempts, st->matches_deduped,
+			st->cap_skipped, st->alias_already_same,
+			st->srccount_seeded,
 			deduped_buf,
 			hrs, mins);
 	}
@@ -1300,6 +1322,20 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 		st.n_ref_files, st.seed_matches_found,
 		st.dedupe_attempts, st.matches_deduped,
 		pretty_size(st.bytes_deduped));
+
+	/*
+	 * Phase 4/5 summary: how often the safety mechanisms fired
+	 * over the run. Useful to identify whether the cap was
+	 * actively protecting hot canonicals (cap_skipped), whether
+	 * multi-pass dedupes correctly skipped already-aliased work
+	 * (alias_already_same), and how many canonicals had their
+	 * srccount initialized from kernel truth (srccount_seeded).
+	 */
+	qprintf("lookup: cap_skipped: %"PRIu64" candidate(s), "
+		"alias_already_same: %"PRIu64" candidate(s), "
+		"srccount_seeded: %"PRIu64" canonical(s).\n",
+		st.cap_skipped, st.alias_already_same,
+		st.srccount_seeded);
 
 	if ((st.n_lookup_files + st.n_self_files) > 0 &&
 	    st.matches_deduped == 0) {
