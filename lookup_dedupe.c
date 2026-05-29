@@ -1212,6 +1212,18 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	st.db = db;
 	st.ref_opens = OPEN_ONCE_INIT;
 	/*
+	 * Bound the FD cache to 4096 entries via LRU eviction.
+	 * Without this, --lookup-self against a hashfile containing
+	 * many small files (master corpus + extracted files etc.)
+	 * grows the open-FD count monotonically until the soft NOFILE
+	 * limit is hit and open(2) starts returning EMFILE. 4096
+	 * sits well below the default per-process ceiling on any
+	 * modern Linux/Synology system, and is also well above the
+	 * typical working-set of files in any short window of the
+	 * scan, so re-open rate stays low.
+	 */
+	open_once_set_max(&st.ref_opens, 4096);
+	/*
 	 * Start synthetic fileids one less than zero and walk down.
 	 * Positive ids belong to the hashfile; negative ids are
 	 * strictly in-memory and never persisted (--lookup-only never

@@ -98,6 +98,7 @@ static void filerec_token_init(struct filerec_token *token,
 {
 	rb_init_node(&token->t_node);
 	token->t_file = file;
+	INIT_LIST_HEAD(&token->t_lru);
 }
 
 struct filerec_token *filerec_token_new(struct filerec *file)
@@ -272,14 +273,64 @@ void filerec_close(struct filerec *file)
 	g_mutex_unlock(&filerec_fd_mutex);
 }
 
+void open_once_set_max(struct open_once *open_files, unsigned int max)
+{
+	open_files->max_open = max;
+	open_files->open_count = 0;
+	INIT_LIST_HEAD(&open_files->lru);
+}
+
+/*
+ * Drop the least-recently-used open file. Called from filerec_open_once
+ * when adding a new entry would exceed open_files->max_open. The
+ * evicted filerec's fd goes back to -1; callers that re-acquire it via
+ * filerec_open_once later will get a fresh open(2) (and a new LRU
+ * insertion at the head).
+ */
+static void open_once_evict_oldest(struct open_once *open_files)
+{
+	struct filerec_token *t;
+
+	if (list_empty(&open_files->lru))
+		return;
+
+	t = list_entry(open_files->lru.prev, struct filerec_token, t_lru);
+
+	filerec_close(t->t_file);
+	rb_erase(&t->t_node, &open_files->root);
+	list_del(&t->t_lru);
+	filerec_token_free(t);
+	open_files->open_count--;
+}
+
 int filerec_open_once(struct filerec *file,
 		      struct open_once *open_files)
 {
 	int ret;
 	struct filerec_token *token;
 
-	if (find_filerec_token_rb(&open_files->root, file))
+	token = find_filerec_token_rb(&open_files->root, file);
+	if (token) {
+		/*
+		 * Already open. Promote to LRU head so the eviction
+		 * scan keeps it warm. No-op when LRU is disabled
+		 * (max_open == 0): the LRU list is empty / unused
+		 * and we skip the list ops.
+		 */
+		if (open_files->max_open > 0)
+			list_move(&token->t_lru, &open_files->lru);
 		return 0;
+	}
+
+	/*
+	 * Fresh entry. If LRU is enabled and we're at the cap, drop
+	 * the oldest entry first; that closes one fd and removes it
+	 * from the tree+list so the insert below stays within budget.
+	 */
+	if (open_files->max_open > 0 &&
+	    open_files->open_count >= open_files->max_open) {
+		open_once_evict_oldest(open_files);
+	}
 
 	token = filerec_token_new(file);
 	if (!token)
@@ -292,6 +343,11 @@ int filerec_open_once(struct filerec *file,
 	}
 
 	insert_filerec_token_rb(&open_files->root, token);
+
+	if (open_files->max_open > 0) {
+		list_add(&token->t_lru, &open_files->lru);
+		open_files->open_count++;
+	}
 
 	return 0;
 }
@@ -306,10 +362,16 @@ void filerec_close_open_list(struct open_once *open_files)
 
 		filerec_close(t->t_file);
 		rb_erase(&t->t_node, &open_files->root);
+		if (open_files->max_open > 0)
+			list_del(&t->t_lru);
 		filerec_token_free(t);
 
 		n = rb_first(&open_files->root);
 	}
+
+	open_files->open_count = 0;
+	if (open_files->max_open > 0)
+		INIT_LIST_HEAD(&open_files->lru);
 }
 
 int fiemap_scan_extent(struct extent *extent)
