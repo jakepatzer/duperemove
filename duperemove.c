@@ -55,6 +55,7 @@ static int stdin_filelist = 0;
 static unsigned int list_only_opt = 0;
 static unsigned int rm_only_opt = 0;
 static unsigned int build_h16_index_opt = 0;
+static unsigned int reset_lookup_state_opt = 0;
 struct dbfile_config dbfile_cfg;
 
 static enum {
@@ -215,6 +216,7 @@ enum {
 	BUILD_H16_INDEX_OPTION,
 	LOOKUP_MAX_REFLINKS_OPTION,
 	NO_SEED_SRCCOUNT_OPTION,
+	RESET_LOOKUP_STATE_OPTION,
 };
 
 static int process_fdupes(void)
@@ -336,6 +338,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "build-h16-index", 0, NULL, BUILD_H16_INDEX_OPTION },
 		{ "lookup-max-reflinks", 1, NULL, LOOKUP_MAX_REFLINKS_OPTION },
 		{ "no-seed-srccount", 0, NULL, NO_SEED_SRCCOUNT_OPTION },
+		{ "reset-lookup-state", 0, NULL, RESET_LOOKUP_STATE_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -471,6 +474,9 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		case NO_SEED_SRCCOUNT_OPTION:
 			options.no_seed_srccount = true;
 			break;
+		case RESET_LOOKUP_STATE_OPTION:
+			reset_lookup_state_opt = 1;
+			break;
 		case HELP_OPTION:
 			help();
 			break;
@@ -545,6 +551,32 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		 * follow that path; --build-h16-index is its own branch
 		 * in main() and takes precedence over use_hashfile.
 		 */
+		update_hashes = false;
+	}
+
+	if (reset_lookup_state_opt) {
+		if (options.hashfile == NULL) {
+			eprintf("Error: --reset-lookup-state requires "
+				"--hashfile.\n");
+			return EINVAL;
+		}
+		if (options.lookup_only || options.fdupes_mode ||
+		    list_only_opt || rm_only_opt || build_h16_index_opt) {
+			eprintf("Error: --reset-lookup-state is a "
+				"standalone operation; it cannot be "
+				"combined with --lookup-only, --fdupes, "
+				"-L, -R, or --build-h16-index.\n");
+			return EINVAL;
+		}
+		if (write_hashes || read_hashes) {
+			eprintf("Error: --reset-lookup-state is "
+				"incompatible with --write-hashes and "
+				"--read-hashes.\n");
+			return EINVAL;
+		}
+		/* Same rationale as --build-h16-index above: clear
+		 * update_hashes so we don't fall into the scan +
+		 * dedupe pipeline in main(). */
 		update_hashes = false;
 	}
 
@@ -623,10 +655,17 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		}
 	}
 
-	if (!(options.fdupes_mode || list_only_opt || build_h16_index_opt)
+	if (!(options.fdupes_mode || list_only_opt ||
+	      build_h16_index_opt || reset_lookup_state_opt)
 			&& numfiles == 0) {
 		eprintf("Error: a file list argument is required.\n");
 		return 1;
+	}
+
+	if (reset_lookup_state_opt && numfiles > 0) {
+		eprintf("Warning: --reset-lookup-state does not take a "
+			"file list argument; ignoring %d argument(s).\n",
+			numfiles);
 	}
 
 	if (build_h16_index_opt && numfiles > 0) {
@@ -820,6 +859,26 @@ int main(int argc, char **argv)
 		dbfile_set_gdb(db);
 
 		ret = h16_build_index(db);
+		goto out;
+	}
+
+	if (reset_lookup_state_opt) {
+		/*
+		 * --reset-lookup-state is a standalone one-shot
+		 * operation that wipes Phase 4/5 per-position state
+		 * (srccount, alias_root_*) on the blocks table.
+		 * Opens RW; runs one UPDATE; commits + truncates the
+		 * WAL; exits. Use after fixing a seed-side bug to
+		 * force fresh kernel-truth seeds on the next
+		 * --lookup-only run.
+		 */
+		db = dbfile_open_handle(options.hashfile);
+		if (!db)
+			goto out;
+
+		dbfile_set_gdb(db);
+
+		ret = lookup_reset_state(db);
 		goto out;
 	}
 

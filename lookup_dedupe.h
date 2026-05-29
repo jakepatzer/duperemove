@@ -34,4 +34,17 @@ struct dbhandle;
 int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 		       int filelist_idx);
 
+/*
+ * Reset Phase 4/5 per-position state on the blocks table:
+ * srccount -> -1 (the "not seeded" sentinel) and alias_root_fileid /
+ * alias_root_loff -> NULL. Used as a one-shot before re-running
+ * --lookup-only when prior runs left stale cap accounting or alias
+ * pointers (e.g. after fixing the V1-fallback bug in the LOGICAL_INO
+ * seed and wanting fresh kernel-truth counts on next encounter).
+ *
+ * Returns 0 on success or an errno-style code on failure. The DB
+ * must be opened read-write.
+ */
+int lookup_reset_state(struct dbhandle *db);
+
 #endif	/* __LOOKUP_DEDUPE_H__ */

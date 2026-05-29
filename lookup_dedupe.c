@@ -1395,3 +1395,57 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 
 	return rc == ENOMEM ? ENOMEM : 0;
 }
+
+int lookup_reset_state(struct dbhandle *db)
+{
+	int ret;
+	char *errmsg = NULL;
+	/*
+	 * Single UPDATE with a WHERE that skips rows already at the
+	 * sentinel state. Without the WHERE, every row in the blocks
+	 * table would be rewritten (huge WAL churn on 200+ GB
+	 * hashfiles); with it the scan still visits every page but
+	 * only modified pages are written. The cost is therefore
+	 * dominated by sequential read throughput on the hashfile
+	 * disk rather than write bandwidth.
+	 *
+	 * The two state classes (srccount and alias_root) are
+	 * combined into one pass; doing them in separate passes
+	 * would double the scan time for no benefit.
+	 */
+	const char *sql =
+		"UPDATE blocks "
+		"SET srccount = -1, "
+		"    alias_root_fileid = NULL, "
+		"    alias_root_loff = NULL "
+		"WHERE srccount != -1 "
+		"   OR alias_root_fileid IS NOT NULL "
+		"   OR alias_root_loff IS NOT NULL;";
+
+	qprintf("lookup: resetting Phase 4/5 state on blocks "
+		"(srccount, alias_root_*). One full table scan; expect "
+		"this to take a while on large hashfiles.\n");
+
+	ret = sqlite3_exec(db->db, sql, NULL, NULL, &errmsg);
+	if (ret != SQLITE_OK) {
+		eprintf("lookup: reset state UPDATE failed: %s (%d)\n",
+			errmsg ? errmsg : "(no message)", ret);
+		if (errmsg)
+			sqlite3_free(errmsg);
+		return EIO;
+	}
+
+	/*
+	 * Drain the WAL so the freshly-reset state is durable in the
+	 * main DB before we exit. TRUNCATE is fine here because the
+	 * UPDATE has committed and nothing else is touching the DB.
+	 */
+	sqlite3_exec(db->db,
+		     "PRAGMA wal_checkpoint(TRUNCATE);",
+		     NULL, NULL, NULL);
+
+	qprintf("lookup: reset complete; %d row(s) modified.\n",
+		sqlite3_changes(db->db));
+
+	return 0;
+}
