@@ -679,6 +679,27 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 			continue;
 		}
 
+		/*
+		 * Per-seed candidate safety cap + heartbeat. Without
+		 * these, a single seed with a pathologically large
+		 * h16-collision set (e.g., common boot-sector pattern
+		 * matched at hundreds of thousands of positions across
+		 * a master+images corpus) can lock the inner loop in a
+		 * tight SQL-served-from-mmap cycle for hours - 100%
+		 * CPU, zero syscalls, zero progress lines because
+		 * print_progress sits below this loop.
+		 *
+		 * The cap (MAX_CAND_PER_SEED) hard-limits work per
+		 * seed; past it we abandon further candidates and
+		 * advance. The heartbeat calls print_progress every
+		 * HEARTBEAT_EVERY_CAND iterations so the existing
+		 * throttle can fire from inside; the print itself is
+		 * cheap when throttled out.
+		 */
+		uint64_t cand_in_seed = 0;
+#define MAX_CAND_PER_SEED	((uint64_t)65536)
+#define HEARTBEAT_EVERY_CAND	((uint64_t)1024)
+
 		while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
 			int64_t ref_id;
 			uint64_t ref_loff;
@@ -686,6 +707,25 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 			uint64_t ext_len;
 			uint64_t kern_bytes = 0;
 			int sub_rc, oo;
+
+			cand_in_seed++;
+			if (cand_in_seed >= MAX_CAND_PER_SEED) {
+				static bool warned = false;
+				if (!warned) {
+					eprintf("lookup: seed at \"%s\" @ "
+						"%"PRIu64" exceeded "
+						"%"PRIu64" candidates; "
+						"truncating candidate list "
+						"for this seed (further "
+						"occurrences silent)\n",
+						path, off,
+						MAX_CAND_PER_SEED);
+					warned = true;
+				}
+				break;
+			}
+			if ((cand_in_seed % HEARTBEAT_EVERY_CAND) == 0)
+				print_progress(st, path, off, size, false);
 
 			ref_id = sqlite3_column_int64(stmt, 0);
 			ref_loff = sqlite3_column_int64(stmt, 1);
