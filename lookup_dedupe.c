@@ -195,20 +195,27 @@ static void fmt_size_h(uint64_t size, char *str, size_t str_bytes)
 }
 
 /*
- * Periodic in-process WAL checkpoint. PASSIVE never blocks the
- * caller; it drains as many WAL frames as it can without waiting
- * on active readers/writers and returns immediately. On heavy
- * --lookup-self workloads the per-dedupe srccount / alias_root_*
- * UPDATEs accumulate ~170 MB of WAL per 1 GB scanned because every
- * version of every modified page is appended; an unbounded WAL
- * eats hashfile-FS free space at multiples of the actual progress
- * rate. Throttled to once every CHECKPOINT_INTERVAL_SEC so the
- * overhead is negligible (a few ms per minute).
+ * Periodic in-process WAL checkpoint. TRUNCATE drains all
+ * checkpointable frames AND shrinks the WAL file to zero bytes;
+ * PASSIVE drains but leaves the file at the high-water mark. We
+ * chose TRUNCATE here because the call site sits exactly between
+ * sqlite3_reset() of find_block_stmt and the next outer-loop
+ * iteration's sqlite3_bind/sqlite3_step, so our own connection
+ * has no active reader snapshot at this instant - TRUNCATE will
+ * find nothing blocking it and the file shrinks every firing.
  *
- * A SQLITE_LOCKED return is not an error here: it means a prepared
- * statement in this process held a shared lock at the instant the
- * pragma ran. The frames stay in the WAL and the next firing will
- * drain them.
+ * Throttled to once every CHECKPOINT_INTERVAL_SEC. The exec is
+ * fire-and-forget: SQLITE_BUSY (returned when an external
+ * connection somehow holds a snapshot at the same moment, or if
+ * a future revision adds concurrency inside this process) just
+ * means this firing didn't drain and the WAL stays at its current
+ * size; the next firing will try again. No correctness impact.
+ *
+ * Without this, per-dedupe srccount / alias_root_* UPDATEs
+ * accumulate ~170 MB of WAL per 1 GB scanned because every version
+ * of every modified page is appended; on a 3.5 TB --lookup-self
+ * workload that's ~600 GB of WAL versus the typical hashfile-FS
+ * free space.
  */
 #define CHECKPOINT_INTERVAL_SEC 30.0
 static void maybe_checkpoint(struct lookup_state *st)
@@ -224,7 +231,7 @@ static void maybe_checkpoint(struct lookup_state *st)
 		return;
 
 	sqlite3_exec(st->db->db,
-		     "PRAGMA wal_checkpoint(PASSIVE);",
+		     "PRAGMA wal_checkpoint(TRUNCATE);",
 		     NULL, NULL, NULL);
 	st->last_checkpoint_time = now;
 }
