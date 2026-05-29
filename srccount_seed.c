@@ -288,6 +288,15 @@ int srccount_lazy_seed(struct lookup_state *st,
 		sqlite3_bind_int64(upd, 1, (int64_t)count);
 		sqlite3_bind_int64(upd, 2, canon_fileid);
 		sqlite3_bind_int64(upd, 3, (int64_t)canon_loff);
+		/*
+		 * ?4 is srccount_gen: stamp the canonical with the
+		 * current global generation so future encounters know
+		 * this srccount value is Phase-5-vouched-for at this
+		 * generation. Without this, outer-skip's stale-gen
+		 * detection couldn't distinguish "freshly seeded" from
+		 * "left over from a pre-bump invocation".
+		 */
+		sqlite3_bind_int64(upd, 4, st->current_srccount_gen);
 
 		rc = sqlite3_step(upd);
 		if (rc != SQLITE_DONE) {

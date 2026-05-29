@@ -398,7 +398,8 @@ static void print_progress(struct lookup_state *st, const char *path,
 static int resolve_canonical(struct lookup_state *st,
 			     int64_t fileid, uint64_t loff,
 			     int64_t *canon_fileid, uint64_t *canon_loff,
-			     int64_t *canon_srccount)
+			     int64_t *canon_srccount,
+			     int64_t *canon_srccount_gen)
 {
 	sqlite3_stmt *stmt = st->select_alias_root_stmt;
 	int rc;
@@ -406,6 +407,7 @@ static int resolve_canonical(struct lookup_state *st,
 	int64_t a_fileid;
 	int64_t a_loff;
 	int64_t srccount;
+	int64_t srccount_gen;
 
 	sqlite3_reset(stmt);
 	sqlite3_bind_int64(stmt, 1, fileid);
@@ -429,19 +431,21 @@ static int resolve_canonical(struct lookup_state *st,
 
 	alias_type = sqlite3_column_type(stmt, 0);
 	srccount = sqlite3_column_int64(stmt, 2);
+	srccount_gen = sqlite3_column_int64(stmt, 3);
 
 	if (alias_type == SQLITE_NULL) {
 		/* Position is its own canonical. */
 		*canon_fileid = fileid;
 		*canon_loff = loff;
 		*canon_srccount = srccount;
+		*canon_srccount_gen = srccount_gen;
 		return 0;
 	}
 
 	a_fileid = sqlite3_column_int64(stmt, 0);
 	a_loff = sqlite3_column_int64(stmt, 1);
 
-	/* Need to fetch the canonical's srccount via a second SELECT. */
+	/* Need to fetch the canonical's srccount + gen via a second SELECT. */
 	sqlite3_reset(st->select_srccount_stmt);
 	sqlite3_bind_int64(st->select_srccount_stmt, 1, a_fileid);
 	sqlite3_bind_int64(st->select_srccount_stmt, 2, a_loff);
@@ -458,6 +462,7 @@ static int resolve_canonical(struct lookup_state *st,
 		*canon_fileid = fileid;
 		*canon_loff = loff;
 		*canon_srccount = srccount;
+		*canon_srccount_gen = srccount_gen;
 		return 0;
 	}
 	if (rc != SQLITE_ROW) {
@@ -468,6 +473,7 @@ static int resolve_canonical(struct lookup_state *st,
 	*canon_fileid = a_fileid;
 	*canon_loff = a_loff;
 	*canon_srccount = sqlite3_column_int64(st->select_srccount_stmt, 0);
+	*canon_srccount_gen = sqlite3_column_int64(st->select_srccount_stmt, 1);
 	return 0;
 }
 
@@ -635,24 +641,59 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 			int64_t dst_cf = file_fr->fileid;
 			uint64_t dst_cl = off;
 			int64_t dst_cs = -1;
+			int64_t dst_cg = 0;
 			int r;
 
 			r = resolve_canonical(st, file_fr->fileid, off,
-					      &dst_cf, &dst_cl, &dst_cs);
+					      &dst_cf, &dst_cl, &dst_cs,
+					      &dst_cg);
 			if (r == EIO) {
 				rc = EIO;
 				break;
 			}
-			if (r == 0 &&
-			    ((dst_cf != file_fr->fileid ||
-			      dst_cl != off) ||
-			     dst_cs > 1)) {
-				st->alias_already_same++;
-				off += blocksize;
-				st->bytes_scanned_total += blocksize;
-				print_progress(st, path, off, size, false);
-				maybe_checkpoint(st);
-				continue;
+			/*
+			 * Outer-skip rule (optimistic w/ gen counter):
+			 *
+			 *   (1) aliased: dst_cf/cl != (file_fr->fileid, off)
+			 *   (2) fresh-gen real canonical: dst is its own
+			 *       canon, gen matches current, srccount > 1
+			 *       (we trust the value - it's a real
+			 *       canonical-for-others)
+			 *   (3) stale-gen processed: dst is its own canon,
+			 *       gen < current, srccount != -1 (it was
+			 *       Phase-5'd or inc'd at some prior gen and
+			 *       since invalidated by --bump-srccount-gen).
+			 *       We CONSERVATIVELY treat as a real canonical
+			 *       to avoid migration. The cost is missing
+			 *       legit dedups on canonicals that happened
+			 *       to be srccount==1 with stale gen.
+			 *
+			 * Truly fresh canonicals (srccount==-1) ALWAYS
+			 * proceed to inner loop regardless of gen. They
+			 * need first-time processing.
+			 */
+			if (r == 0) {
+				bool aliased =
+					(dst_cf != file_fr->fileid ||
+					 dst_cl != off);
+				bool fresh_real_canon =
+					!aliased &&
+					dst_cg == st->current_srccount_gen &&
+					dst_cs > 1;
+				bool stale_processed =
+					!aliased &&
+					dst_cg < st->current_srccount_gen &&
+					dst_cs != -1;
+				if (aliased || fresh_real_canon ||
+				    stale_processed) {
+					st->alias_already_same++;
+					off += blocksize;
+					st->bytes_scanned_total += blocksize;
+					print_progress(st, path, off,
+						       size, false);
+					maybe_checkpoint(st);
+					continue;
+				}
 			}
 		}
 
@@ -882,12 +923,14 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 			int64_t canon_fileid = ref_id;
 			uint64_t canon_loff = ref_loff;
 			int64_t canon_srccount = -1;
+			int64_t canon_srccount_gen = 0;
 			{
 				int r = resolve_canonical(st, ref_id,
 							  ref_loff,
 							  &canon_fileid,
 							  &canon_loff,
-							  &canon_srccount);
+							  &canon_srccount,
+							  &canon_srccount_gen);
 				if (r == EIO) {
 					/* SQL failure: bail on this seed. */
 					break;
@@ -898,26 +941,25 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 			}
 
 			/*
-			 * Phase 5: if the canonical's srccount is the
-			 * "not seeded" sentinel (-1), ask the kernel
-			 * for the real reflink count via
-			 * LOGICAL_INO_V2 and persist it back to the
-			 * row. Subsequent hits on this canonical see
-			 * the cached value with no kernel call.
+			 * Phase 5: refresh canon's srccount when either
+			 * (a) the value is the -1 sentinel ("never seeded"),
+			 * or (b) srccount_gen < current generation (the
+			 * value was set in a prior generation that has
+			 * since been invalidated by --bump-srccount-gen).
 			 *
-			 * The seed call only happens on canonicals we
-			 * actually consider as candidates - positions
-			 * never matched by an h16 lookup never get
-			 * seeded, which is exactly what we want
-			 * (positions that aren't candidates can't
-			 * accumulate reflinks from us).
+			 * Case (b) is the lazy-invalidation mechanism: a
+			 * --bump increments the global gen, after which
+			 * all existing rows look "stale" and get refreshed
+			 * on next encounter as a candidate.
 			 *
-			 * --no-seed-srccount disables this; the cap
-			 * check then treats -1 as 0 and counts only
+			 * --no-seed-srccount disables both branches; the
+			 * cap check then treats -1 as 0 and counts only
 			 * the reflinks we add ourselves.
 			 */
 			if (!options.no_seed_srccount &&
-			    canon_srccount < 0) {
+			    (canon_srccount < 0 ||
+			     canon_srccount_gen <
+				st->current_srccount_gen)) {
 				int64_t seeded = 0;
 				int sr = srccount_lazy_seed(st,
 						canon_fileid, canon_loff,
@@ -925,6 +967,8 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 						&seeded);
 				if (sr == 0) {
 					canon_srccount = seeded;
+					canon_srccount_gen =
+						st->current_srccount_gen;
 					st->srccount_seeded++;
 				}
 				/* On failure we keep canon_srccount at
@@ -971,13 +1015,15 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 				int64_t dst_canon_fileid = file_fr->fileid;
 				uint64_t dst_canon_loff = off;
 				int64_t dst_canon_srccount = -1;
+				int64_t dst_canon_srccount_gen = 0;
 				int r;
 
 				r = resolve_canonical(st, file_fr->fileid,
 						      off,
 						      &dst_canon_fileid,
 						      &dst_canon_loff,
-						      &dst_canon_srccount);
+						      &dst_canon_srccount,
+						      &dst_canon_srccount_gen);
 				if (r == EIO) {
 					break;
 				}
@@ -1413,6 +1459,20 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	st.is_tty = isatty(STDERR_FILENO);
 
 	/*
+	 * Load the global srccount generation. This value is the
+	 * "what gen are we running at" - rows whose srccount_gen is
+	 * less than this are stale and will be lazily re-seeded by
+	 * Phase 5 on next encounter as a candidate. Fall back to 0
+	 * on read failure so an absent config row (first run after
+	 * migration) behaves identically to gen 0 - everything
+	 * matches and nothing is stale.
+	 */
+	if (dbfile_get_srccount_gen(db, &st.current_srccount_gen) != 0)
+		st.current_srccount_gen = 0;
+	qprintf("lookup: srccount generation = %"PRId64"\n",
+		st.current_srccount_gen);
+
+	/*
 	 * Prepare the h16-based lookup statement. Keyed by the 16 KB
 	 * rolling-window hash; the covering idx_blocks_h16 index
 	 * makes this an O(log n) index-only scan, no blocks_h16
@@ -1453,8 +1513,8 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	 * for ad-hoc composites.
 	 */
 	rc = sqlite3_prepare_v2(db->db,
-		"select alias_root_fileid, alias_root_loff, srccount "
-		"from blocks where fileid = ?1 and loff = ?2;",
+		"select alias_root_fileid, alias_root_loff, srccount, "
+		"srccount_gen from blocks where fileid = ?1 and loff = ?2;",
 		-1, &st.select_alias_root_stmt, NULL);
 	if (rc) {
 		eprintf("lookup: preparing alias-root select: %s\n",
@@ -1463,7 +1523,8 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	}
 
 	rc = sqlite3_prepare_v2(db->db,
-		"select srccount from blocks where fileid = ?1 and loff = ?2;",
+		"select srccount, srccount_gen from blocks "
+		"where fileid = ?1 and loff = ?2;",
 		-1, &st.select_srccount_stmt, NULL);
 	if (rc) {
 		eprintf("lookup: preparing srccount select: %s\n",
@@ -1492,12 +1553,13 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	}
 
 	/*
-	 * Phase 5: set srccount to a specific value (used to transition
-	 * canonicals from -1 to the kernel-truth reflink count after a
-	 * successful LOGICAL_INO_V2 seed).
+	 * Phase 5: set srccount to a specific value AND record the
+	 * generation at which this value is vouched-for. The gen
+	 * write is what distinguishes "Phase 5 fired and the value
+	 * is fresh" from a stale value left over from a prior gen.
 	 */
 	rc = sqlite3_prepare_v2(db->db,
-		"update blocks set srccount = ?1 "
+		"update blocks set srccount = ?1, srccount_gen = ?4 "
 		"where fileid = ?2 and loff = ?3;",
 		-1, &st.set_srccount_stmt, NULL);
 	if (rc) {

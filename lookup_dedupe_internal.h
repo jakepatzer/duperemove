@@ -76,6 +76,15 @@ struct lookup_state {
 	 * final version in the main DB and frees the WAL frames.
 	 */
 	struct timespec	last_checkpoint_time;
+
+	/*
+	 * Cached global srccount generation. Loaded once at
+	 * lookup_dedupe_main entry from the config table; immutable
+	 * for the lifetime of the run. Phase 5 writes this value to
+	 * the per-row srccount_gen column when it fires; the outer-
+	 * skip rule uses this to detect stale srccount values.
+	 */
+	int64_t		current_srccount_gen;
 	uint64_t	bytes_scanned_total;
 	uint64_t	bytes_scanned_at_last;
 	int		is_tty;

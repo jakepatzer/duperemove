@@ -205,4 +205,18 @@ int dbfile_remove_hashes(struct dbhandle *db, int64_t fileid);
 
 unsigned int get_max_dedupe_seq(struct dbhandle *db);
 int dbfile_prune_unscanned_files(struct dbhandle *db);
+
+/*
+ * srccount generation counter API. Used to lazily invalidate srccount
+ * values across the entire blocks table without an O(N) UPDATE.
+ *
+ * dbfile_get_srccount_gen: read the global current generation. Returns
+ * 0 in *out_gen if no row exists yet (first run after migration).
+ *
+ * dbfile_bump_srccount_gen: atomically increment the global generation.
+ * After this, every blocks row with srccount_gen < new generation is
+ * "stale" and Phase 5 will re-seed it on next encounter.
+ */
+int dbfile_get_srccount_gen(struct dbhandle *db, int64_t *out_gen);
+int dbfile_bump_srccount_gen(struct dbhandle *db, int64_t *out_new_gen);
 #endif	/* __DBFILE_H__ */

@@ -56,6 +56,7 @@ static unsigned int list_only_opt = 0;
 static unsigned int rm_only_opt = 0;
 static unsigned int build_h16_index_opt = 0;
 static unsigned int reset_lookup_state_opt = 0;
+static unsigned int bump_srccount_gen_opt = 0;
 struct dbfile_config dbfile_cfg;
 
 static enum {
@@ -219,6 +220,7 @@ enum {
 	RESET_LOOKUP_STATE_OPTION,
 	LOOKUP_FD_CACHE_OPTION,
 	LOOKUP_PROGRESS_INTERVAL_OPTION,
+	BUMP_SRCCOUNT_GEN_OPTION,
 };
 
 static int process_fdupes(void)
@@ -343,6 +345,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "reset-lookup-state", 0, NULL, RESET_LOOKUP_STATE_OPTION },
 		{ "lookup-fd-cache", 1, NULL, LOOKUP_FD_CACHE_OPTION },
 		{ "lookup-progress-interval", 1, NULL, LOOKUP_PROGRESS_INTERVAL_OPTION },
+		{ "bump-srccount-gen", 0, NULL, BUMP_SRCCOUNT_GEN_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -509,6 +512,9 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			options.lookup_progress_interval = (uint32_t)v;
 			break;
 		}
+		case BUMP_SRCCOUNT_GEN_OPTION:
+			bump_srccount_gen_opt = 1;
+			break;
 		case HELP_OPTION:
 			help();
 			break;
@@ -612,6 +618,42 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		update_hashes = false;
 	}
 
+	if (bump_srccount_gen_opt) {
+		if (options.hashfile == NULL) {
+			eprintf("Error: --bump-srccount-gen requires "
+				"--hashfile.\n");
+			return EINVAL;
+		}
+		/*
+		 * Bump is a one-shot SQL operation, not heavy work.
+		 * It composes naturally with --lookup-only /
+		 * --lookup-self: bump first, then enter the lookup.
+		 * Don't allow it alongside other standalone db-mutating
+		 * operations (--build-h16-index, --reset-lookup-state)
+		 * since those have their own exclusivity rules; and
+		 * don't allow it with --fdupes / -L / -R which don't
+		 * touch the srccount column at all.
+		 */
+		if (options.fdupes_mode || list_only_opt || rm_only_opt ||
+		    build_h16_index_opt || reset_lookup_state_opt) {
+			eprintf("Error: --bump-srccount-gen cannot be "
+				"combined with --fdupes, -L, -R, "
+				"--build-h16-index, or "
+				"--reset-lookup-state.\n");
+			return EINVAL;
+		}
+		if (write_hashes || read_hashes) {
+			eprintf("Error: --bump-srccount-gen is "
+				"incompatible with --write-hashes and "
+				"--read-hashes.\n");
+			return EINVAL;
+		}
+		/* If passed alone (no --lookup-only either), don't
+		 * fall into the scan + dedupe pipeline. */
+		if (!options.lookup_only)
+			update_hashes = false;
+	}
+
 	/* Filter out option combinations that don't make sense. */
 	if ((write_hashes + read_hashes + update_hashes) > 1) {
 		eprintf("Error: Specify only one hashfile option.\n");
@@ -688,7 +730,8 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 	}
 
 	if (!(options.fdupes_mode || list_only_opt ||
-	      build_h16_index_opt || reset_lookup_state_opt)
+	      build_h16_index_opt || reset_lookup_state_opt ||
+	      bump_srccount_gen_opt || options.lookup_only)
 			&& numfiles == 0) {
 		eprintf("Error: a file list argument is required.\n");
 		return 1;
@@ -698,6 +741,13 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		eprintf("Warning: --reset-lookup-state does not take a "
 			"file list argument; ignoring %d argument(s).\n",
 			numfiles);
+	}
+
+	if (bump_srccount_gen_opt && !options.lookup_only &&
+	    numfiles > 0) {
+		eprintf("Warning: --bump-srccount-gen alone does not "
+			"take a file list argument; ignoring %d "
+			"argument(s).\n", numfiles);
 	}
 
 	if (build_h16_index_opt && numfiles > 0) {
@@ -914,6 +964,25 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
+	if (bump_srccount_gen_opt && !options.lookup_only) {
+		/*
+		 * Standalone --bump-srccount-gen (no --lookup-only):
+		 * just open the db, run the bump, exit. After this,
+		 * the next --lookup-only run sees the new generation
+		 * and Phase 5 lazily re-seeds canonicals on encounter.
+		 */
+		int64_t new_gen = 0;
+		db = dbfile_open_handle(options.hashfile);
+		if (!db)
+			goto out;
+		dbfile_set_gdb(db);
+		ret = dbfile_bump_srccount_gen(db, &new_gen);
+		if (ret == 0)
+			qprintf("srccount generation bumped to %"PRId64
+				"\n", new_gen);
+		goto out;
+	}
+
 	if (options.lookup_only) {
 		/*
 		 * --lookup-only opens the hashfile strictly read-only
@@ -939,6 +1008,22 @@ int main(int argc, char **argv)
 				dbfile_cfg.blocksize);
 			ret = EINVAL;
 			goto out;
+		}
+
+		/*
+		 * Combined --bump-srccount-gen + --lookup-only: bump
+		 * first so lookup_dedupe_main loads the freshly-bumped
+		 * generation into st->current_srccount_gen. This is the
+		 * primary intended usage - "invalidate stale srccount
+		 * and immediately run with the new gen."
+		 */
+		if (bump_srccount_gen_opt) {
+			int64_t new_gen = 0;
+			ret = dbfile_bump_srccount_gen(db, &new_gen);
+			if (ret)
+				goto out;
+			qprintf("srccount generation bumped to %"PRId64
+				"\n", new_gen);
 		}
 
 		print_header();

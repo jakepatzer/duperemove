@@ -261,6 +261,33 @@ static int dbfile_migrate_blocks_columns(sqlite3 *db)
 		}
 	}
 
+	/*
+	 * srccount_gen: per-row generation tag for the srccount value.
+	 * Phase 5 records the global "current generation" here when it
+	 * fires. The outer-skip rule in lookup_dedupe treats a row as
+	 * stale (srccount value not trustworthy) if srccount_gen <
+	 * current generation. A --bump-srccount-gen invalidates all
+	 * existing srccount values O(1) without rewriting the table.
+	 *
+	 * Default 0 matches the initial value of the global
+	 * "srccount_gen" config row (also defaulting to 0 when absent),
+	 * so before any --bump, ALL rows are "fresh at gen 0" - the
+	 * stale branch of the skip rule never fires on an unbumped db.
+	 */
+	present = dbfile_column_present(db, "blocks", "srccount_gen");
+	if (present < 0)
+		return EIO;
+	if (!present) {
+		ret = sqlite3_exec(db,
+			"ALTER TABLE blocks ADD COLUMN "
+			"srccount_gen INTEGER NOT NULL DEFAULT 0;",
+			NULL, NULL, NULL);
+		if (ret) {
+			perror_sqlite(ret, "adding blocks.srccount_gen column");
+			return ret;
+		}
+	}
+
 	return 0;
 }
 
@@ -1013,6 +1040,25 @@ struct dbhandle *dbfile_open_handle_readonly(char *filename)
 	if (strncasecmp(cfg.hash_type, HASH_TYPE, 8)) {
 		eprintf("Hashfile uses hash \"%.*s\" but this build uses "
 			"\"%.*s\".\n", 8, cfg.hash_type, 8, HASH_TYPE);
+		goto err;
+	}
+
+	/*
+	 * Run blocks-column migration even on the "readonly" open.
+	 * The path is actually RW (see comment above) and the
+	 * migration is idempotent - it ALTER TABLE ADD COLUMNs only
+	 * when the column isn't already present. Without this, a
+	 * lookup-only run against a hashfile that hasn't been opened
+	 * with the new binary's full-RW path would be missing the
+	 * srccount_gen column (added by this version's migration)
+	 * and every SELECT would fail. Cost on a hashfile that
+	 * already has the columns is one PRAGMA table_info per
+	 * column (~µs total).
+	 */
+	ret = dbfile_migrate_blocks_columns(result->db);
+	if (ret) {
+		perror_sqlite(ret,
+			      "migrating blocks columns (readonly open)");
 		goto err;
 	}
 
@@ -2114,5 +2160,78 @@ int dbfile_prune_unscanned_files(struct dbhandle *db)
 		return ret;
 	}
 
+	return 0;
+}
+
+/*
+ * Read the global srccount generation from the config table.
+ * Missing row is treated as 0 (the default at first migration).
+ * Returns 0 on success and sets *out_gen; non-zero errno on SQL
+ * failure (caller falls back to 0 in that case).
+ */
+int dbfile_get_srccount_gen(struct dbhandle *db, int64_t *out_gen)
+{
+	sqlite3_stmt *stmt = NULL;
+	int rc;
+	int64_t gen = 0;
+
+	rc = sqlite3_prepare_v2(db->db,
+		"SELECT keyval FROM config WHERE keyname = 'srccount_gen';",
+		-1, &stmt, NULL);
+	if (rc != SQLITE_OK) {
+		perror_sqlite(rc, "preparing srccount_gen SELECT");
+		return EIO;
+	}
+
+	rc = sqlite3_step(stmt);
+	if (rc == SQLITE_ROW) {
+		gen = sqlite3_column_int64(stmt, 0);
+	} else if (rc != SQLITE_DONE) {
+		perror_sqlite(rc, "stepping srccount_gen SELECT");
+		sqlite3_finalize(stmt);
+		return EIO;
+	}
+	sqlite3_finalize(stmt);
+
+	*out_gen = gen;
+	return 0;
+}
+
+/*
+ * Increment the global srccount generation. Used by
+ * --bump-srccount-gen to lazily invalidate all existing srccount
+ * values: after the bump, every row with srccount_gen < new
+ * current_gen is "stale" and will be re-seeded by Phase 5 on
+ * next encounter as a candidate.
+ *
+ * Single INSERT OR REPLACE with COALESCE so the first-ever bump
+ * correctly transitions from "no row" (treated as 0) to 1.
+ */
+int dbfile_bump_srccount_gen(struct dbhandle *db, int64_t *out_new_gen)
+{
+	int rc;
+	char *err = NULL;
+	int64_t new_gen = 0;
+
+	rc = sqlite3_exec(db->db,
+		"INSERT OR REPLACE INTO config(keyname, keyval) "
+		"VALUES ('srccount_gen', "
+		"COALESCE((SELECT keyval FROM config "
+		"WHERE keyname = 'srccount_gen'), 0) + 1);",
+		NULL, NULL, &err);
+	if (rc != SQLITE_OK) {
+		eprintf("bump-srccount-gen: %s (%d)\n",
+			err ? err : "(no message)", rc);
+		if (err)
+			sqlite3_free(err);
+		return EIO;
+	}
+
+	rc = dbfile_get_srccount_gen(db, &new_gen);
+	if (rc)
+		return rc;
+
+	if (out_new_gen)
+		*out_new_gen = new_gen;
 	return 0;
 }
