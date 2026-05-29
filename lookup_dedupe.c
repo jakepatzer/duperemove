@@ -222,6 +222,8 @@ static void maybe_checkpoint(struct lookup_state *st)
 {
 	struct timespec now;
 	double elapsed;
+	int rc, n_log = 0, n_ckpt = 0;
+	static bool busy_logged = false;
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	elapsed = (now.tv_sec - st->last_checkpoint_time.tv_sec) +
@@ -230,9 +232,45 @@ static void maybe_checkpoint(struct lookup_state *st)
 	if (elapsed < CHECKPOINT_INTERVAL_SEC)
 		return;
 
-	sqlite3_exec(st->db->db,
-		     "PRAGMA wal_checkpoint(TRUNCATE);",
-		     NULL, NULL, NULL);
+	/*
+	 * Explicitly reset every prepared statement before the
+	 * checkpoint. Even though the inner loop just reset
+	 * find_block_stmt, SQLite may still consider the connection
+	 * to be in an implicit read transaction if any other
+	 * statement has been stepped without an intervening reset
+	 * (resolve_canonical's selects, the seed-side selects, etc.)
+	 * Resetting all of them guarantees the connection holds no
+	 * read snapshot, so TRUNCATE doesn't return SQLITE_BUSY
+	 * because of our own lingering reader state.
+	 *
+	 * sqlite3_reset on an already-reset statement is a cheap
+	 * no-op, so the unconditional reset of all six is fine.
+	 */
+	sqlite3_reset(st->find_block_stmt);
+	sqlite3_reset(st->select_alias_root_stmt);
+	sqlite3_reset(st->select_srccount_stmt);
+	sqlite3_reset(st->inc_srccount_stmt);
+	sqlite3_reset(st->set_alias_root_stmt);
+	sqlite3_reset(st->set_srccount_stmt);
+
+	/*
+	 * Use the v2 API so we can see the return code and report
+	 * BUSY once. If TRUNCATE still hits BUSY despite the reset
+	 * above, that means an external connection is holding a
+	 * read snapshot (e.g., the user has a sqlite3 shell open).
+	 */
+	rc = sqlite3_wal_checkpoint_v2(st->db->db, NULL,
+				       SQLITE_CHECKPOINT_TRUNCATE,
+				       &n_log, &n_ckpt);
+	if (rc == SQLITE_BUSY && !busy_logged) {
+		eprintf("lookup: WAL checkpoint(TRUNCATE) returned "
+			"BUSY (log=%d ckpt=%d frames); WAL file will "
+			"not shrink. An external connection is holding "
+			"a snapshot. Further BUSY returns will be "
+			"silent.\n", n_log, n_ckpt);
+		busy_logged = true;
+	}
+
 	st->last_checkpoint_time = now;
 }
 
@@ -251,7 +289,7 @@ static void print_progress(struct lookup_state *st, const char *path,
 	elapsed_since = (now.tv_sec - st->last_progress_time.tv_sec) +
 			(now.tv_nsec - st->last_progress_time.tv_nsec) / 1e9;
 
-	if (!final && elapsed_since < 2.0)
+	if (!final && elapsed_since < (double)options.lookup_progress_interval)
 		return;
 	/*
 	 * Final-emit is only useful if at least one in-progress line
@@ -1212,17 +1250,21 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	st.db = db;
 	st.ref_opens = OPEN_ONCE_INIT;
 	/*
-	 * Bound the FD cache to 4096 entries via LRU eviction.
-	 * Without this, --lookup-self against a hashfile containing
-	 * many small files (master corpus + extracted files etc.)
-	 * grows the open-FD count monotonically until the soft NOFILE
-	 * limit is hit and open(2) starts returning EMFILE. 4096
-	 * sits well below the default per-process ceiling on any
-	 * modern Linux/Synology system, and is also well above the
-	 * typical working-set of files in any short window of the
-	 * scan, so re-open rate stays low.
+	 * Bound the FD cache via LRU eviction. Without this,
+	 * --lookup-self against a hashfile containing many small
+	 * files (master corpus + extracted files etc.) grows the
+	 * open-FD count monotonically until the soft NOFILE limit
+	 * is hit and open(2) starts returning EMFILE.
+	 *
+	 * Default 2048 sits safely below typical hard NOFILE limits
+	 * (e.g., Synology DSM 7 ships hard = 4096). Reserve ~10
+	 * slots for stdio + sqlite hashfile/WAL + current scanned
+	 * target file + glib/sqlite internals; using 50% of the
+	 * default hard limit as the LRU cap leaves a comfortable
+	 * margin. Override with --lookup-fd-cache N to raise it
+	 * after bumping ulimit (e.g., `prlimit --nofile=65536`).
 	 */
-	open_once_set_max(&st.ref_opens, 4096);
+	open_once_set_max(&st.ref_opens, options.lookup_fd_cache);
 	/*
 	 * Start synthetic fileids one less than zero and walk down.
 	 * Positive ids belong to the hashfile; negative ids are

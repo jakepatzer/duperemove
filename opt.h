@@ -85,6 +85,27 @@ struct options {
 	 * and the LOGICAL_INO_V2 calls are pure overhead.
 	 */
 	bool no_seed_srccount : 1;
+
+	/*
+	 * --lookup-fd-cache=N: cap on simultaneously-open reference
+	 * filerec FDs during --lookup-only / --lookup-self. Bounded
+	 * LRU eviction prevents EMFILE on hashfiles containing many
+	 * small files. Default 2048; sits comfortably below typical
+	 * NOFILE hard limits (e.g., Synology DSM ships 4096).
+	 *
+	 * Higher values reduce re-open churn if the working set is
+	 * larger than 2048 files; raise the process NOFILE limit via
+	 * `prlimit --nofile=N` or equivalent before bumping this.
+	 */
+	uint32_t lookup_fd_cache;
+
+	/*
+	 * --lookup-progress-interval=N: seconds between throttled
+	 * progress emits. Default 10. Lower for live monitoring,
+	 * higher to keep run logs compact (each line is ~250 bytes;
+	 * 2s emits add up to MB of log per hour).
+	 */
+	uint32_t lookup_progress_interval;
 };
 
 extern struct options options;

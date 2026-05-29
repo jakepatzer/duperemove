@@ -26,4 +26,6 @@ struct options options = {
 	.fdupes_mode = false,
 	.lookup_max_reflinks = 500,
 	.no_seed_srccount = false,
+	.lookup_fd_cache = 2048,
+	.lookup_progress_interval = 10,
 };

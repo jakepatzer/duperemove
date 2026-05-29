@@ -217,6 +217,8 @@ enum {
 	LOOKUP_MAX_REFLINKS_OPTION,
 	NO_SEED_SRCCOUNT_OPTION,
 	RESET_LOOKUP_STATE_OPTION,
+	LOOKUP_FD_CACHE_OPTION,
+	LOOKUP_PROGRESS_INTERVAL_OPTION,
 };
 
 static int process_fdupes(void)
@@ -339,6 +341,8 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "lookup-max-reflinks", 1, NULL, LOOKUP_MAX_REFLINKS_OPTION },
 		{ "no-seed-srccount", 0, NULL, NO_SEED_SRCCOUNT_OPTION },
 		{ "reset-lookup-state", 0, NULL, RESET_LOOKUP_STATE_OPTION },
+		{ "lookup-fd-cache", 1, NULL, LOOKUP_FD_CACHE_OPTION },
+		{ "lookup-progress-interval", 1, NULL, LOOKUP_PROGRESS_INTERVAL_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -477,6 +481,34 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		case RESET_LOOKUP_STATE_OPTION:
 			reset_lookup_state_opt = 1;
 			break;
+		case LOOKUP_FD_CACHE_OPTION: {
+			unsigned long v;
+			char *endp = NULL;
+			v = strtoul(optarg, &endp, 10);
+			if (endp == optarg || *endp != '\0' || v == 0 ||
+			    v > UINT32_MAX) {
+				eprintf("Error: --lookup-fd-cache must be a "
+					"positive integer (got \"%s\").\n",
+					optarg);
+				return EINVAL;
+			}
+			options.lookup_fd_cache = (uint32_t)v;
+			break;
+		}
+		case LOOKUP_PROGRESS_INTERVAL_OPTION: {
+			unsigned long v;
+			char *endp = NULL;
+			v = strtoul(optarg, &endp, 10);
+			if (endp == optarg || *endp != '\0' || v == 0 ||
+			    v > UINT32_MAX) {
+				eprintf("Error: --lookup-progress-interval "
+					"must be a positive integer "
+					"(got \"%s\").\n", optarg);
+				return EINVAL;
+			}
+			options.lookup_progress_interval = (uint32_t)v;
+			break;
+		}
 		case HELP_OPTION:
 			help();
 			break;
