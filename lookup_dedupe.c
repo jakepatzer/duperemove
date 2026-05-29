@@ -217,7 +217,7 @@ static void fmt_size_h(uint64_t size, char *str, size_t str_bytes)
  * workload that's ~600 GB of WAL versus the typical hashfile-FS
  * free space.
  */
-#define CHECKPOINT_INTERVAL_SEC 30.0
+#define CHECKPOINT_INTERVAL_SEC 300.0
 static void maybe_checkpoint(struct lookup_state *st)
 {
 	struct timespec now;
