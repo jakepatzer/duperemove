@@ -927,6 +927,44 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 			}
 
 			/*
+			 * Phase 5 short-circuit (Bug 2 fix). If the
+			 * canonical's CURRENT DB value of srccount is
+			 * already at or above cap, we can cap_skip
+			 * immediately without firing Phase 5 V1.
+			 *
+			 * Why this is safe: srccount is monotonic in our
+			 * system - inc_srccount only increases it, and
+			 * Phase 5 only overwrites with V1 truth which is
+			 * itself monotonic (kernel reflinks only grow
+			 * unless an external tool removes them, which
+			 * none do in supported configurations). So if
+			 * stale srccount >= cap, fresh V1 truth >= cap
+			 * too -> cap_skip outcome is unchanged.
+			 *
+			 * Why this matters: without short-circuit, a hot
+			 * seed where every candidate's canonical is
+			 * saturated still pays a full Phase 5 V1 ioctl
+			 * per candidate (~50-700ms each on saturated
+			 * extents) before cap_skipping. For ~1M candidates
+			 * that's hours-to-days. With short-circuit, each
+			 * candidate cap_skips in ~50us. Same outcome,
+			 * thousands of times faster.
+			 *
+			 * Note: skip is guarded on canon_srccount >= 0
+			 * because canon_srccount < 0 means "unknown" -
+			 * we still want Phase 5 to fire and discover the
+			 * real value (which might turn out < cap and lead
+			 * to a successful dedupe).
+			 */
+			{
+				int64_t cap = (int64_t)options.lookup_max_reflinks;
+				if (canon_srccount >= cap) {
+					st->cap_skipped++;
+					continue;
+				}
+			}
+
+			/*
 			 * Phase 5: refresh canon's srccount when either
 			 * (a) the value is the -1 sentinel ("never seeded"),
 			 * or (b) srccount_gen < current generation (the
@@ -962,6 +1000,16 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 				 * still enforced for OUR adds. */
 			}
 
+			/*
+			 * Cap check after potential Phase 5 refresh.
+			 * Covers two cases the short-circuit above
+			 * doesn't: (a) canon_srccount was -1, Phase 5
+			 * fired and returned a value >= cap, and
+			 * (b) canon_srccount was below cap but Phase 5
+			 * fired and returned >= cap (e.g., other dedups
+			 * added reflinks since the stale value was
+			 * captured).
+			 */
 			{
 				int64_t cap = (int64_t)options.lookup_max_reflinks;
 				int64_t effective = canon_srccount < 0 ?
