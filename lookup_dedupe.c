@@ -252,6 +252,8 @@ static void maybe_checkpoint(struct lookup_state *st)
 	sqlite3_reset(st->inc_srccount_stmt);
 	sqlite3_reset(st->set_alias_root_stmt);
 	sqlite3_reset(st->set_srccount_stmt);
+	sqlite3_reset(st->harvest_max_srccount_stmt);
+	sqlite3_reset(st->bulk_set_alias_root_stmt);
 
 	/*
 	 * Use the v2 API so we can see the return code and report
@@ -500,30 +502,14 @@ static int inc_srccount_at(struct lookup_state *st,
 }
 
 /*
- * Set alias_root at (fileid, loff) to point to (canon_fileid,
- * canon_loff). For Phase 1 lookup-self only (fileid > 0); the
- * caller is responsible for that gate.
+ * set_alias_root_at was the per-block alias_root writer used before
+ * Tier 2 introduced bulk_set_alias_root_stmt over the full deduped
+ * range. Deleted - the success path now uses the range UPDATE
+ * exclusively. set_alias_root_stmt is preserved at the
+ * struct/prepare/reset/finalize sites for now since it may still be
+ * useful for future code paths that want a single-row write, but
+ * has no live callers.
  */
-static int set_alias_root_at(struct lookup_state *st,
-			     int64_t fileid, uint64_t loff,
-			     int64_t canon_fileid, uint64_t canon_loff)
-{
-	sqlite3_stmt *stmt = st->set_alias_root_stmt;
-	int rc;
-
-	sqlite3_reset(stmt);
-	sqlite3_bind_int64(stmt, 1, fileid);
-	sqlite3_bind_int64(stmt, 2, (int64_t)loff);
-	sqlite3_bind_int64(stmt, 3, canon_fileid);
-	sqlite3_bind_int64(stmt, 4, (int64_t)canon_loff);
-
-	rc = sqlite3_step(stmt);
-	if (rc != SQLITE_DONE) {
-		perror_sqlite(rc, "lookup: stepping set_alias_root");
-		return EIO;
-	}
-	return 0;
-}
 
 static int stream_blocks(const char *path, struct filerec *file_fr,
 			 uint64_t size, struct lookup_state *st)
@@ -1102,36 +1088,175 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 				st->bytes_deduped += kern_bytes;
 
 				/*
-				 * Phase 4 bookkeeping. Increment
-				 * srccount on the canonical (the
-				 * physical extent we just added a
-				 * reflink to) and, if file_fr lives in
-				 * the hashfile, persist its alias_root
-				 * so subsequent passes know which
-				 * canonical it now references. The
-				 * UPDATEs are best-effort: a SQL
-				 * failure here would log but should not
-				 * abort the seed, since the kernel
-				 * reflink already exists.
+				 * Round the kernel-acknowledged dedupe
+				 * length down to blocksize. This is the
+				 * range over which we'll write
+				 * alias_root, AND the amount we advance
+				 * `off` by below. Subsequent seed
+				 * offsets stay block-aligned (otherwise
+				 * their h16 values cannot match any
+				 * entry in blocks_h16).
 				 */
-				(void)inc_srccount_at(st, canon_fileid,
-						      canon_loff);
-				if (file_fr->fileid > 0) {
-					(void)set_alias_root_at(st,
-						file_fr->fileid, off,
-						canon_fileid,
-						canon_loff);
+				step = (kern_bytes / blocksize) * blocksize;
+
+				/*
+				 * Tier 2 bookkeeping. The kernel just
+				 * shared `step` bytes (potentially many
+				 * blocks) of file_fr's range
+				 * [off, off+step) with canonical's
+				 * extent. We must:
+				 *
+				 *  (a) Harvest the largest CURRENT-GEN
+				 *      srccount across that range -
+				 *      represents the freshest V1-truth
+				 *      that prior Phase 5 calls
+				 *      deposited on any individual
+				 *      block when it was a candidate of
+				 *      someone else's scan. Stale-gen
+				 *      values are intentionally
+				 *      excluded so we don't stamp a
+				 *      pre-bump number as fresh on the
+				 *      canonical.
+				 *
+				 *  (b) Mark EVERY block in [off, off+step)
+				 *      as aliased to the canonical's
+				 *      seed position. Without this,
+				 *      only the seed block would get
+				 *      alias_root set and the other
+				 *      blocks would be re-attempted
+				 *      every subsequent run (the bug
+				 *      this fix addresses).
+				 *
+				 *  (c) Update the canonical's srccount
+				 *      to max(canon_current, harvested)
+				 *      + 1, stamping it as fresh at the
+				 *      current generation.
+				 *
+				 * All three are best-effort (errors are
+				 * logged but don't abort the seed),
+				 * since the kernel reflink already
+				 * exists regardless of DB state.
+				 *
+				 * The `file_fr->fileid > 0` guard
+				 * (current code: required because
+				 * transient lookup-only targets with
+				 * negative fileids have no rows in
+				 * blocks) is preserved by the outer if.
+				 */
+				if (file_fr->fileid > 0 && step > 0) {
+					int64_t max_observed = -1;
+					bool max_observed_valid = false;
+					int rc2;
+					sqlite3_stmt *qh =
+						st->harvest_max_srccount_stmt;
+					sqlite3_stmt *qb =
+						st->bulk_set_alias_root_stmt;
+
+					/* (a) Harvest max current-gen
+					 * srccount across the range. */
+					sqlite3_reset(qh);
+					sqlite3_bind_int64(qh, 1,
+						file_fr->fileid);
+					sqlite3_bind_int64(qh, 2,
+						(int64_t)off);
+					sqlite3_bind_int64(qh, 3,
+						(int64_t)(off + step));
+					sqlite3_bind_int64(qh, 4,
+						st->current_srccount_gen);
+					rc2 = sqlite3_step(qh);
+					if (rc2 == SQLITE_ROW &&
+					    sqlite3_column_type(qh, 0) !=
+					    SQLITE_NULL) {
+						max_observed =
+							sqlite3_column_int64(
+								qh, 0);
+						max_observed_valid = true;
+					}
+
+					/* (b) Bulk alias_root across the
+					 * range. Half-open interval
+					 * (loff < off+step) excludes the
+					 * canonical when canon is at the
+					 * boundary (same-file gap-checked
+					 * case). */
+					sqlite3_reset(qb);
+					sqlite3_bind_int64(qb, 1,
+						canon_fileid);
+					sqlite3_bind_int64(qb, 2,
+						(int64_t)canon_loff);
+					sqlite3_bind_int64(qb, 3,
+						file_fr->fileid);
+					sqlite3_bind_int64(qb, 4,
+						(int64_t)off);
+					sqlite3_bind_int64(qb, 5,
+						(int64_t)(off + step));
+					rc2 = sqlite3_step(qb);
+					if (rc2 != SQLITE_DONE) {
+						perror_sqlite(rc2,
+							"lookup: bulk "
+							"alias_root update");
+					}
+
+					/*
+					 * (c) Update canonical srccount.
+					 * Reuse the canon_srccount value
+					 * already in scope from the
+					 * earlier resolve_canonical /
+					 * Phase 5 call - no need to
+					 * re-fetch. Preserve the -1
+					 * sentinel when both the current
+					 * value and the harvest are
+					 * "unknown" - that way Phase 5
+					 * will still fire on this
+					 * canonical next time it's seen
+					 * as a candidate.
+					 */
+					if (canon_srccount != -1 ||
+					    max_observed_valid) {
+						int64_t baseline =
+							canon_srccount;
+						if (max_observed_valid &&
+						    max_observed > baseline)
+							baseline = max_observed;
+						int64_t new_canon =
+							baseline + 1;
+
+						sqlite3_stmt *qs =
+							st->set_srccount_stmt;
+						sqlite3_reset(qs);
+						sqlite3_bind_int64(qs, 1,
+							new_canon);
+						sqlite3_bind_int64(qs, 2,
+							canon_fileid);
+						sqlite3_bind_int64(qs, 3,
+							(int64_t)canon_loff);
+						sqlite3_bind_int64(qs, 4,
+							st->current_srccount_gen);
+						rc2 = sqlite3_step(qs);
+						if (rc2 != SQLITE_DONE) {
+							perror_sqlite(rc2,
+								"lookup: canon "
+								"srccount update");
+						}
+					}
+				} else if (step > 0) {
+					/*
+					 * Transient lookup-only target
+					 * (negative fileid, no blocks
+					 * rows to update). Still need to
+					 * bump the canonical's srccount
+					 * so cap accounting reflects the
+					 * new reflink we just added to
+					 * its extent.
+					 */
+					(void)inc_srccount_at(st,
+						canon_fileid, canon_loff);
 				}
 
 				/*
 				 * High-water skip: advance past the
 				 * range the kernel actually deduped.
-				 * Round down to blocksize to keep
-				 * subsequent seed offsets block-aligned
-				 * (otherwise their h16 values cannot
-				 * match any entry in blocks_h16).
 				 */
-				step = (kern_bytes / blocksize) * blocksize;
 				if (step >= blocksize)
 					advance = step;
 				break;	/* this seed is satisfied */
@@ -1569,6 +1694,46 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	}
 
 	/*
+	 * Tier 2: harvest MAX(srccount) over a (fileid, loff) half-open
+	 * range, filtered to only current-generation rows. Used after a
+	 * successful FIDEDUPERANGE to find the freshest V1-truth value
+	 * any block in the deduped range has, so the canonical's srccount
+	 * can be corrected upward without paying for a new V1 ioctl.
+	 * Filter on srccount_gen = ?4 prevents adopting stale-gen values.
+	 */
+	rc = sqlite3_prepare_v2(db->db,
+		"select max(srccount) from blocks "
+		"where fileid = ?1 and loff >= ?2 and loff < ?3 "
+		"and srccount_gen = ?4;",
+		-1, &st.harvest_max_srccount_stmt, NULL);
+	if (rc) {
+		eprintf("lookup: preparing harvest_max_srccount: %s\n",
+			sqlite3_errstr(rc));
+		return EIO;
+	}
+
+	/*
+	 * Tier 2: bulk write alias_root_fileid/loff across a (fileid,
+	 * loff) half-open range. Used to mark EVERY block in a
+	 * extend_match-extended dedupe range as aliased to the canonical,
+	 * not just the seed block. The half-open interval (>= ?4 AND <
+	 * ?5) ensures the canonical's own row at loff = ?5 = off + step
+	 * (boundary in --lookup-self same-file case, gated by the
+	 * gap pre-check earlier in the inner loop) is NOT included -
+	 * avoids the canonical-aliased-to-itself corruption.
+	 */
+	rc = sqlite3_prepare_v2(db->db,
+		"update blocks set alias_root_fileid = ?1, "
+		"alias_root_loff = ?2 "
+		"where fileid = ?3 and loff >= ?4 and loff < ?5;",
+		-1, &st.bulk_set_alias_root_stmt, NULL);
+	if (rc) {
+		eprintf("lookup: preparing bulk_set_alias_root: %s\n",
+			sqlite3_errstr(rc));
+		return EIO;
+	}
+
+	/*
 	 * Initialize the coalesce high-water map even though our
 	 * streaming loop also performs a within-file high-water skip
 	 * by advancing the offset directly. coalesce_record() is
@@ -1595,6 +1760,8 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	sqlite3_finalize(st.inc_srccount_stmt);
 	sqlite3_finalize(st.set_alias_root_stmt);
 	sqlite3_finalize(st.set_srccount_stmt);
+	sqlite3_finalize(st.harvest_max_srccount_stmt);
+	sqlite3_finalize(st.bulk_set_alias_root_stmt);
 	coalesce_map_destroy();
 
 	qprintf("lookup: %"PRIu64" lookup file(s) processed, "

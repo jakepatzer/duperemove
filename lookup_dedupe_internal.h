@@ -45,6 +45,25 @@ struct lookup_state {
 	 */
 	sqlite3_stmt	*set_srccount_stmt;
 
+	/*
+	 * Tier 2 alias_root coverage fix.
+	 *
+	 * harvest_max_srccount_stmt: SELECT MAX(srccount) over a (fileid,
+	 * loff) range, gated on srccount_gen = current_gen. Returns the
+	 * largest CURRENT-GEN srccount among dst blocks in the deduped
+	 * range. This recovers V1-truth that prior Phase 5 calls deposited
+	 * on individual blocks when they were candidates of someone else's
+	 * scan. Old-gen values are excluded to avoid stamping a stale
+	 * number as fresh on the canonical.
+	 *
+	 * bulk_set_alias_root_stmt: UPDATE alias_root_fileid/loff for ALL
+	 * blocks in the (fileid, loff) range. Without this, extend_match
+	 * dedupes covering N blocks only marked the seed block as aliased,
+	 * leaving the other N-1 blocks looking canonical-unseeded forever.
+	 */
+	sqlite3_stmt	*harvest_max_srccount_stmt;
+	sqlite3_stmt	*bulk_set_alias_root_stmt;
+
 	struct open_once ref_opens;
 	int64_t		next_synth_id;	/* counter for in-memory-only ids */
 	uint64_t	n_lookup_files;
