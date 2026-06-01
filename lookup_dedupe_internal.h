@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <time.h>
 
+#include <glib.h>
 #include <sqlite3.h>
 
 #include "filerec.h"
@@ -82,6 +83,26 @@ struct lookup_state {
 						 * lazy LOGICAL_INO_V2 seed
 						 * fired and wrote a value
 						 * back */
+
+	/*
+	 * Per-run h16 saturation blacklist. An h16 enters the blacklist
+	 * when its candidate list returns 100% cap_skip with zero
+	 * successful dedupes in a seed - i.e., every position in the
+	 * corpus matching that 16 KB content pattern resolves to a
+	 * cap-saturated canonical. Future seeds whose h16 matches one
+	 * already in the blacklist skip the SQL lookup + inner loop
+	 * entirely.
+	 *
+	 * Keyed by 16-byte h16 bytes; values are unused (presence-only).
+	 * The blacklist is in-memory only because cap state can change
+	 * across runs (via --bump-srccount-gen, --reset-lookup-state,
+	 * cap config changes) and we don't want stale entries.
+	 *
+	 * h16_blacklist_skipped counts whole-seed skips via this fast
+	 * path - displayed on the progress line for visibility.
+	 */
+	GHashTable	*h16_blacklist;
+	uint64_t	h16_blacklist_skipped;
 
 	struct timespec	start_time;
 	struct timespec	last_progress_time;

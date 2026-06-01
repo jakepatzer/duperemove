@@ -217,6 +217,26 @@ static void fmt_size_h(uint64_t size, char *str, size_t str_bytes)
  * workload that's ~600 GB of WAL versus the typical hashfile-FS
  * free space.
  */
+/*
+ * h16 blacklist hash/equal helpers. h16 is 16 bytes of XXH128 output;
+ * we treat it as opaque bytes and compare bytewise. The hash function
+ * just folds the 16 bytes into one guint (combining the two halves)
+ * - good enough distribution for GHashTable since XXH128 is already
+ * a high-quality hash and the entries are bounded by saturated-h16
+ * count (tens of thousands to maybe ~1M).
+ */
+static guint h16_hash_func(gconstpointer key)
+{
+	const uint64_t *p = key;
+	uint64_t mixed = p[0] ^ p[1];
+	return (guint)(mixed ^ (mixed >> 32));
+}
+
+static gboolean h16_equal_func(gconstpointer a, gconstpointer b)
+{
+	return memcmp(a, b, DIGEST_LEN) == 0;
+}
+
 #define CHECKPOINT_INTERVAL_SEC 300.0
 static void maybe_checkpoint(struct lookup_state *st)
 {
@@ -339,7 +359,7 @@ static void print_progress(struct lookup_state *st, const char *path,
 			"%5.0f MB/s now %5.0f avg | "
 			"cand %"PRIu64" attempts %"PRIu64" ok %"PRIu64" | "
 			"cap_skip %"PRIu64" alias %"PRIu64
-			" seed %"PRIu64" | "
+			" seed %"PRIu64" bl %"PRIu64" | "
 			"deduped %s | %dh%02dm\033[K\r",
 			st->n_lookup_files + st->n_self_files + 1,
 			name,
@@ -349,6 +369,7 @@ static void print_progress(struct lookup_state *st, const char *path,
 			st->dedupe_attempts, st->matches_deduped,
 			st->cap_skipped, st->alias_already_same,
 			st->srccount_seeded,
+			st->h16_blacklist_skipped,
 			deduped_buf,
 			hrs, mins);
 	} else {
@@ -357,7 +378,7 @@ static void print_progress(struct lookup_state *st, const char *path,
 			"%5.0f MB/s now %5.0f avg | "
 			"cand %"PRIu64" attempts %"PRIu64" ok %"PRIu64" | "
 			"cap_skip %"PRIu64" alias %"PRIu64
-			" seed %"PRIu64" | "
+			" seed %"PRIu64" bl %"PRIu64" | "
 			"deduped %s | %dh%02dm\n",
 			st->n_lookup_files + st->n_self_files + 1,
 			name,
@@ -367,6 +388,7 @@ static void print_progress(struct lookup_state *st, const char *path,
 			st->dedupe_attempts, st->matches_deduped,
 			st->cap_skipped, st->alias_already_same,
 			st->srccount_seeded,
+			st->h16_blacklist_skipped,
 			deduped_buf,
 			hrs, mins);
 	}
@@ -761,6 +783,34 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 		memcpy(concat + 3 * DIGEST_LEN,    digests[3], DIGEST_LEN);
 		checksum_block((char *)concat, sizeof(concat), h16);
 
+		/*
+		 * h16 saturation blacklist check. If an earlier seed in
+		 * this run produced 100% cap_skip for this exact h16,
+		 * skip the SQL lookup and inner candidate iteration
+		 * entirely - we know all candidates will resolve to a
+		 * cap-saturated canonical. Saves the lookup query (~50us)
+		 * plus per-candidate processing (~50us each, often
+		 * thousands of candidates per hot-content h16).
+		 *
+		 * Safe because srccount is monotonic in our system - a
+		 * canonical that hit cap won't drop below it (no external
+		 * reflink-removing tools, no snapshot expiry). So an h16
+		 * blacklisted in this run stays valid for the run's
+		 * lifetime.
+		 *
+		 * In-memory only; not persisted because cap state can
+		 * change across runs (--bump-srccount-gen,
+		 * --reset-lookup-state, cap config change).
+		 */
+		if (g_hash_table_contains(st->h16_blacklist, h16)) {
+			st->h16_blacklist_skipped++;
+			off += blocksize;
+			st->bytes_scanned_total += blocksize;
+			print_progress(st, path, off, size, false);
+			maybe_checkpoint(st);
+			continue;
+		}
+
 		rc = sqlite3_bind_blob(stmt, 1, h16, DIGEST_LEN,
 				       SQLITE_STATIC);
 		if (rc) {
@@ -789,6 +839,18 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 		 * cheap when throttled out.
 		 */
 		uint64_t cand_in_seed = 0;
+		/*
+		 * Per-seed bookkeeping for the h16 blacklist decision.
+		 * If we exit the inner loop via candidate-list exhaustion
+		 * (sqlite3_step returns DONE), cand_in_seed > 0, no
+		 * successful dedupe happened, and EVERY candidate
+		 * cap_skipped, then this h16's content is fully saturated
+		 * and we add it to the blacklist so future seeds matching
+		 * the same h16 skip the SQL lookup + inner loop entirely.
+		 */
+		uint64_t cap_skip_in_seed_at_start = st->cap_skipped;
+		bool seed_had_success = false;
+		bool seed_bailed_early = false;
 /*
  * Safety cap on per-seed candidate iterations. With the outer-loop
  * dst-alias hoist, the realistic worst case for a single seed is
@@ -823,6 +885,7 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 						MAX_CAND_PER_SEED);
 					warned = true;
 				}
+				seed_bailed_early = true;
 				break;
 			}
 			if ((cand_in_seed % HEARTBEAT_EVERY_CAND) == 0)
@@ -919,6 +982,7 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 							  &canon_srccount_gen);
 				if (r == EIO) {
 					/* SQL failure: bail on this seed. */
+					seed_bailed_early = true;
 					break;
 				}
 				/* r == ENOENT means candidate not in
@@ -1059,6 +1123,7 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 						      &dst_canon_srccount,
 						      &dst_canon_srccount_gen);
 				if (r == EIO) {
+					seed_bailed_early = true;
 					break;
 				}
 				if (r == 0 &&
@@ -1307,10 +1372,34 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 				 */
 				if (step >= blocksize)
 					advance = step;
+				seed_had_success = true;
 				break;	/* this seed is satisfied */
 			}
 		}
 		sqlite3_reset(stmt);
+
+		/*
+		 * h16 blacklist decision: if the inner loop exited via
+		 * normal candidate-list exhaustion (no early bail, no
+		 * success), and EVERY candidate it processed cap_skipped,
+		 * this h16's content has a saturated canonical and no
+		 * dedupe is possible. Add to blacklist so future seeds
+		 * with the same h16 short-circuit the SQL lookup.
+		 */
+		if (!seed_had_success && !seed_bailed_early &&
+		    cand_in_seed > 0) {
+			uint64_t cap_skips_in_seed =
+				st->cap_skipped - cap_skip_in_seed_at_start;
+			if (cap_skips_in_seed == cand_in_seed) {
+				void *key = malloc(DIGEST_LEN);
+				if (key) {
+					memcpy(key, h16, DIGEST_LEN);
+					g_hash_table_insert(
+						st->h16_blacklist, key,
+						GINT_TO_POINTER(1));
+				}
+			}
+		}
 
 		off += advance;
 		st->bytes_scanned_total += advance;
@@ -1646,6 +1735,16 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 		st.current_srccount_gen);
 
 	/*
+	 * h16 saturation blacklist: in-memory hash set of h16 values
+	 * known (from earlier seeds in this run) to be fully cap-saturated.
+	 * Keys are g_memdup'd 16-byte buffers; freed on hashtable destroy.
+	 */
+	st.h16_blacklist = g_hash_table_new_full(h16_hash_func,
+						 h16_equal_func,
+						 free, NULL);
+	st.h16_blacklist_skipped = 0;
+
+	/*
 	 * Prepare the h16-based lookup statement. Keyed by the 16 KB
 	 * rolling-window hash; the covering idx_blocks_h16 index
 	 * makes this an O(log n) index-only scan, no blocks_h16
@@ -1810,6 +1909,8 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	sqlite3_finalize(st.set_srccount_stmt);
 	sqlite3_finalize(st.harvest_max_srccount_stmt);
 	sqlite3_finalize(st.bulk_set_alias_root_stmt);
+	if (st.h16_blacklist)
+		g_hash_table_destroy(st.h16_blacklist);
 	coalesce_map_destroy();
 
 	qprintf("lookup: %"PRIu64" lookup file(s) processed, "
