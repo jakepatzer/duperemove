@@ -104,6 +104,18 @@ struct lookup_state {
 	GHashTable	*h16_blacklist;
 	uint64_t	h16_blacklist_skipped;
 
+	/*
+	 * Bytes skipped by --skip-zeroes. Each time the leading
+	 * blocksize of a seed window is all-zero and we skip the h16
+	 * compute + SQL lookup, this counter advances by blocksize.
+	 * Surfaced on the progress line so the user can quantify the
+	 * data left on the table by the flag (zero blocks are
+	 * trivially dedupable across the entire corpus to a single
+	 * shared extent; --skip-zeroes trades that gain for csum +
+	 * SQL overhead avoidance).
+	 */
+	uint64_t	zero_bytes_skipped;
+
 	struct timespec	start_time;
 	struct timespec	last_progress_time;
 	/*

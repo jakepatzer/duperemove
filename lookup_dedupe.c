@@ -339,6 +339,9 @@ static void print_progress(struct lookup_state *st, const char *path,
 
 	fmt_size_h(st->bytes_deduped, deduped_buf, sizeof(deduped_buf));
 
+	char zero_buf[16];
+	fmt_size_h(st->zero_bytes_skipped, zero_buf, sizeof(zero_buf));
+
 	/*
 	 * Phase 4/5 visibility on the live progress line:
 	 *   cap_skip  - candidates skipped because canonical srccount
@@ -359,7 +362,7 @@ static void print_progress(struct lookup_state *st, const char *path,
 			"%5.0f MB/s now %5.0f avg | "
 			"cand %"PRIu64" attempts %"PRIu64" ok %"PRIu64" | "
 			"cap_skip %"PRIu64" alias %"PRIu64
-			" seed %"PRIu64" bl %"PRIu64" | "
+			" seed %"PRIu64" bl %"PRIu64" zero %s | "
 			"deduped %s | %dh%02dm\033[K\r",
 			st->n_lookup_files + st->n_self_files + 1,
 			name,
@@ -370,6 +373,7 @@ static void print_progress(struct lookup_state *st, const char *path,
 			st->cap_skipped, st->alias_already_same,
 			st->srccount_seeded,
 			st->h16_blacklist_skipped,
+			zero_buf,
 			deduped_buf,
 			hrs, mins);
 	} else {
@@ -378,7 +382,7 @@ static void print_progress(struct lookup_state *st, const char *path,
 			"%5.0f MB/s now %5.0f avg | "
 			"cand %"PRIu64" attempts %"PRIu64" ok %"PRIu64" | "
 			"cap_skip %"PRIu64" alias %"PRIu64
-			" seed %"PRIu64" bl %"PRIu64" | "
+			" seed %"PRIu64" bl %"PRIu64" zero %s | "
 			"deduped %s | %dh%02dm\n",
 			st->n_lookup_files + st->n_self_files + 1,
 			name,
@@ -389,6 +393,7 @@ static void print_progress(struct lookup_state *st, const char *path,
 			st->cap_skipped, st->alias_already_same,
 			st->srccount_seeded,
 			st->h16_blacklist_skipped,
+			zero_buf,
 			deduped_buf,
 			hrs, mins);
 	}
@@ -594,7 +599,14 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 	 */
 	st->progress_active = false;
 
-	qprintf("lookup: scanning \"%s\" (%s, file %"PRIu64")\n",
+	/*
+	 * Per-file start announcement is verbose-only. With millions of
+	 * small files in the transient-lookup path, qprintf here would
+	 * emit millions of stdout lines. The periodic progress line
+	 * already surfaces the current file name (basename), so users
+	 * can identify what's being processed without one line per file.
+	 */
+	vprintf("lookup: scanning \"%s\" (%s, file %"PRIu64")\n",
 		path, pretty_size(size),
 		st->n_lookup_files + st->n_self_files + 1);
 
@@ -759,6 +771,7 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 			 * though `off` is racing forward.
 			 */
 			st->bytes_scanned_total += blocksize;
+			st->zero_bytes_skipped += blocksize;
 			continue;
 		}
 
@@ -1743,6 +1756,7 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 						 h16_equal_func,
 						 free, NULL);
 	st.h16_blacklist_skipped = 0;
+	st.zero_bytes_skipped = 0;
 
 	/*
 	 * Prepare the h16-based lookup statement. Keyed by the 16 KB
