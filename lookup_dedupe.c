@@ -311,21 +311,16 @@ static void print_progress(struct lookup_state *st, const char *path,
 	elapsed_since = (now.tv_sec - st->last_progress_time.tv_sec) +
 			(now.tv_nsec - st->last_progress_time.tv_nsec) / 1e9;
 
-	if (!final && elapsed_since < (double)options.lookup_progress_interval)
-		return;
 	/*
-	 * Final-emit is only useful if at least one in-progress line
-	 * was already shown for this file. For files that complete in
-	 * under one throttle window the file is fast enough that the
-	 * end-of-run summary is sufficient; skipping avoids noise.
-	 *
-	 * Also only useful in TTY mode: the in-progress emits use \r
-	 * (no newline) so the next file's content would visually clobber
-	 * the last in-progress line without a final \n. In non-TTY mode
-	 * every emit already ends in \n, so the final-emit is just a
-	 * duplicate line with the same stats - skip it.
+	 * Single throttle for every emit site (mid-file heartbeat,
+	 * outer-loop bottom, end-of-file). One progress line per
+	 * --lookup-progress-interval seconds, period. The `final`
+	 * parameter no longer distinguishes behavior; it remains in
+	 * the signature for the TTY \r-termination path handled by
+	 * the caller after stream_blocks returns.
 	 */
-	if (final && (!st->progress_active || !st->is_tty))
+	(void)final;
+	if (elapsed_since < (double)options.lookup_progress_interval)
 		return;
 
 	elapsed_total = (now.tv_sec - st->start_time.tv_sec) +
@@ -1427,11 +1422,19 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 	}
 
 	/*
-	 * Commit the in-flight progress line (if any) with a \n so the
-	 * next file's qprintf "scanning" message on stdout does not
-	 * land on top of it.
+	 * TTY-only line termination. The throttled in-progress emits use
+	 * \r so successive lines overwrite each other on the same row;
+	 * without a \n at end-of-file the next file's first throttled
+	 * emit would clobber visible state. We emit just the newline,
+	 * NOT a full progress line - that would defeat the "one log per
+	 * --lookup-progress-interval" guarantee. In non-TTY mode every
+	 * emit already ends in \n, so nothing to do.
 	 */
-	print_progress(st, path, off, size, true);
+	if (st->is_tty && st->progress_active) {
+		fputc('\n', stderr);
+		fflush(stderr);
+		st->progress_active = false;
+	}
 
 	free(buf);
 	return 0;
