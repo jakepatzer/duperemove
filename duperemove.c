@@ -222,6 +222,7 @@ enum {
 	LOOKUP_PROGRESS_INTERVAL_OPTION,
 	BUMP_SRCCOUNT_GEN_OPTION,
 	LOOKUP_START_FROM_OPTION,
+	ZERO_ONLY_DEDUPE_OPTION,
 };
 
 static int process_fdupes(void)
@@ -348,6 +349,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "lookup-progress-interval", 1, NULL, LOOKUP_PROGRESS_INTERVAL_OPTION },
 		{ "bump-srccount-gen", 0, NULL, BUMP_SRCCOUNT_GEN_OPTION },
 		{ "lookup-start-from", 1, NULL, LOOKUP_START_FROM_OPTION },
+		{ "zero-only-dedupe", 0, NULL, ZERO_ONLY_DEDUPE_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -530,6 +532,9 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 			options.lookup_start_from = (uint64_t)v;
 			break;
 		}
+		case ZERO_ONLY_DEDUPE_OPTION:
+			options.zero_only_dedupe = true;
+			break;
 		case HELP_OPTION:
 			help();
 			break;
@@ -995,6 +1000,22 @@ int main(int argc, char **argv)
 		if (ret == 0)
 			qprintf("srccount generation bumped to %"PRId64
 				"\n", new_gen);
+		goto out;
+	}
+
+	if (options.zero_only_dedupe) {
+		/*
+		 * --zero-only-dedupe bypasses the hashfile entirely.
+		 * No DB open, no schema, no h16 lookup - just walks the
+		 * cmdline paths, detects all-zero runs (>= min_dedupe_size,
+		 * aligned to blocksize), and FIDEDUPERANGE-batches them
+		 * against a rotating canonical zero extent. Cap rotation
+		 * uses --lookup-max-reflinks. Progress via the standard
+		 * pre-walk + throttled progress line.
+		 */
+		extern int zero_only_dedupe_main(int argc, char **argv,
+						 int filelist_idx);
+		ret = zero_only_dedupe_main(argc, argv, filelist_idx);
 		goto out;
 	}
 

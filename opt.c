@@ -29,4 +29,5 @@ struct options options = {
 	.lookup_fd_cache = 2048,
 	.lookup_progress_interval = 10,
 	.lookup_start_from = 0,
+	.zero_only_dedupe = false,
 };

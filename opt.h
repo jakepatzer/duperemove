@@ -119,6 +119,17 @@ struct options {
 	 * walk order.
 	 */
 	uint64_t lookup_start_from;
+
+	/*
+	 * --zero-only-dedupe: special mode that bypasses the hashfile
+	 * entirely and only deduplicates all-zero blocks against a
+	 * rotating canonical zero extent. No DB, no h16 computation, no
+	 * candidate iteration - just scan every regular file for
+	 * contiguous zero runs and FIDEDUPERANGE them against the
+	 * current canonical. Cap-aware rotation prevents kernel
+	 * slow-backref pathology on the canonical extent.
+	 */
+	bool zero_only_dedupe;
 };
 
 extern struct options options;
