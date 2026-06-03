@@ -128,6 +128,30 @@ struct lookup_state {
 	 */
 	uint64_t	files_visited;
 
+	/*
+	 * Corpus totals discovered by the pre-walk. lookup_dedupe_main
+	 * walks each cmdline path once with no opens/no processing
+	 * before starting real work, just lstat + readdir, to count
+	 * regular files and sum sizes. Used by the progress line to
+	 * show "% of total files" and "% of total bytes".
+	 *
+	 * Memory cost: just two scalars (no per-file storage).
+	 * Time cost: one lstat per file, no file opens, no reads.
+	 * For a 10M-file corpus on warm fs cache this is well under
+	 * a minute; cold cache may be a few minutes.
+	 *
+	 * bytes_skipped_start_from accumulates the sizes of files
+	 * skipped via --lookup-start-from. Added to bytes_scanned_total
+	 * when computing the bytes-% display so resumed runs report
+	 * total-corpus progress, not just bytes-since-resume progress.
+	 * Kept separate from bytes_scanned_total so MB/s rate stays
+	 * based on actual processing throughput, not a jump at the
+	 * skip boundary.
+	 */
+	uint64_t	total_files_in_walk;
+	uint64_t	total_bytes_to_scan;
+	uint64_t	bytes_skipped_start_from;
+
 	struct timespec	start_time;
 	struct timespec	last_progress_time;
 	/*

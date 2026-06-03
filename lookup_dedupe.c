@@ -343,6 +343,16 @@ static void print_progress(struct lookup_state *st, const char *path,
 	char zero_buf[16];
 	fmt_size_h(st->zero_bytes_skipped, zero_buf, sizeof(zero_buf));
 
+	double files_pct = 0.0;
+	double bytes_pct = 0.0;
+	if (st->total_files_in_walk > 0)
+		files_pct = 100.0 * st->files_visited / st->total_files_in_walk;
+	if (st->total_bytes_to_scan > 0) {
+		uint64_t bytes_done = st->bytes_scanned_total +
+				      st->bytes_skipped_start_from;
+		bytes_pct = 100.0 * bytes_done / st->total_bytes_to_scan;
+	}
+
 	/*
 	 * Phase 4/5 visibility on the live progress line:
 	 *   cap_skip  - candidates skipped because canonical srccount
@@ -359,15 +369,17 @@ static void print_progress(struct lookup_state *st, const char *path,
 	 */
 	if (st->is_tty && !final) {
 		fprintf(stderr,
-			"[lookup] file %"PRIu64" \"%s\" %5.1f%% | "
+			"[lookup] file %"PRIu64"/%"PRIu64" \"%s\" %5.1f%% "
+			"(corpus %5.1f%%f %5.1f%%b) | "
 			"%5.0f MB/s now %5.0f avg | "
 			"cand %"PRIu64" attempts %"PRIu64" ok %"PRIu64" | "
 			"cap_skip %"PRIu64" alias %"PRIu64
 			" seed %"PRIu64" bl %"PRIu64" zero %s | "
 			"deduped %s | %dh%02dm\033[K\r",
-			st->files_visited,
+			st->files_visited, st->total_files_in_walk,
 			name,
 			size > 0 ? (100.0 * off / size) : 0.0,
+			files_pct, bytes_pct,
 			speed_now_mbs, speed_avg_mbs,
 			st->seed_matches_found,
 			st->dedupe_attempts, st->matches_deduped,
@@ -379,15 +391,17 @@ static void print_progress(struct lookup_state *st, const char *path,
 			hrs, mins);
 	} else {
 		fprintf(stderr,
-			"[lookup] file %"PRIu64" \"%s\" %5.1f%% | "
+			"[lookup] file %"PRIu64"/%"PRIu64" \"%s\" %5.1f%% "
+			"(corpus %5.1f%%f %5.1f%%b) | "
 			"%5.0f MB/s now %5.0f avg | "
 			"cand %"PRIu64" attempts %"PRIu64" ok %"PRIu64" | "
 			"cap_skip %"PRIu64" alias %"PRIu64
 			" seed %"PRIu64" bl %"PRIu64" zero %s | "
 			"deduped %s | %dh%02dm\n",
-			st->files_visited,
+			st->files_visited, st->total_files_in_walk,
 			name,
 			size > 0 ? (100.0 * off / size) : 0.0,
+			files_pct, bytes_pct,
 			speed_now_mbs, speed_avg_mbs,
 			st->seed_matches_found,
 			st->dedupe_attempts, st->matches_deduped,
@@ -1557,8 +1571,12 @@ static int process_one_file(const char *path, struct stat *sb,
 	 */
 	st->files_visited++;
 	if (options.lookup_start_from > 0 &&
-	    st->files_visited <= options.lookup_start_from)
+	    st->files_visited <= options.lookup_start_from) {
+		if (sb->st_size > 0)
+			st->bytes_skipped_start_from +=
+				(uint64_t)sb->st_size;
 		return 0;
+	}
 
 	fd = open(path, O_RDONLY);
 	if (fd < 0) {
@@ -1629,6 +1647,93 @@ static int process_one_file(const char *path, struct stat *sb,
 
 	/* Lookup file: hand the open fd off to the streaming loop. */
 	return process_lookup_file(path, fd, (uint64_t)sb->st_size, st);
+}
+
+/*
+ * Pre-walk counting pass. Mirrors walk_path's traversal logic but
+ * does only lstat + readdir + closedir - no opens, no processing,
+ * no allocations beyond stack. Counts every regular file and sums
+ * its size into totals. O(files) time, O(directory_depth) stack,
+ * O(1) heap.
+ *
+ * Errors are swallowed silently because the main walk will surface
+ * them again with proper error messages. We want the pre-walk to
+ * be best-effort: if a directory can't be opened during pre-walk,
+ * the totals will be slightly off but the run continues normally.
+ *
+ * Heartbeat: every 100k files counted, emit a one-line stderr update
+ * so the user knows pre-walk is making progress on huge corpora.
+ */
+struct prewalk_totals {
+	uint64_t files;
+	uint64_t bytes;
+	uint64_t last_heartbeat_files;
+};
+
+#define PREWALK_HEARTBEAT_INTERVAL 100000ULL
+
+static void prewalk_maybe_heartbeat(struct prewalk_totals *t)
+{
+	if (t->files - t->last_heartbeat_files < PREWALK_HEARTBEAT_INTERVAL)
+		return;
+	t->last_heartbeat_files = t->files;
+	fprintf(stderr, "lookup: pre-walk %"PRIu64" files, %s total\r",
+		t->files, pretty_size(t->bytes));
+	fflush(stderr);
+}
+
+static void prewalk_count_file(struct prewalk_totals *t, off_t size)
+{
+	t->files++;
+	if (size > 0)
+		t->bytes += (uint64_t)size;
+	prewalk_maybe_heartbeat(t);
+}
+
+static void prewalk_path(const char *path, struct prewalk_totals *t)
+{
+	struct stat sb;
+	DIR *d;
+	struct dirent *e;
+
+	if (lstat(path, &sb) < 0)
+		return;
+
+	if (S_ISREG(sb.st_mode)) {
+		prewalk_count_file(t, sb.st_size);
+		return;
+	}
+
+	if (!S_ISDIR(sb.st_mode))
+		return;
+
+	d = opendir(path);
+	if (d == NULL)
+		return;
+
+	while ((e = readdir(d)) != NULL) {
+		char child[PATH_MAX];
+
+		if (e->d_name[0] == '.' &&
+		    (e->d_name[1] == 0 ||
+		     (e->d_name[1] == '.' && e->d_name[2] == 0)))
+			continue;
+
+		if ((size_t)snprintf(child, sizeof(child), "%s/%s",
+				     path, e->d_name) >= sizeof(child))
+			continue;
+
+		if (options.recurse_dirs) {
+			prewalk_path(child, t);
+		} else {
+			struct stat csb;
+			if (lstat(child, &csb) < 0)
+				continue;
+			if (S_ISREG(csb.st_mode))
+				prewalk_count_file(t, csb.st_size);
+		}
+	}
+	closedir(d);
 }
 
 /*
@@ -1780,6 +1885,9 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	st.h16_blacklist_skipped = 0;
 	st.zero_bytes_skipped = 0;
 	st.files_visited = 0;
+	st.total_files_in_walk = 0;
+	st.total_bytes_to_scan = 0;
+	st.bytes_skipped_start_from = 0;
 
 	/*
 	 * Prepare the h16-based lookup statement. Keyed by the 16 KB
@@ -1927,6 +2035,36 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	 * when --coalesce is off.
 	 */
 	coalesce_map_init();
+
+	/*
+	 * Pre-walk pass: count regular files and sum sizes across all
+	 * cmdline paths. Result is used as denominator for the
+	 * progress line's "% of total files" and "% of total bytes"
+	 * displays. Memory cost is O(1); time cost is one lstat per
+	 * regular file. For corpora large enough that the wait is
+	 * noticeable, the heartbeat line keeps the user informed.
+	 */
+	{
+		struct prewalk_totals pt = { 0 };
+		struct timespec pt_start, pt_end;
+		double pt_elapsed;
+
+		clock_gettime(CLOCK_MONOTONIC, &pt_start);
+		fprintf(stderr, "lookup: pre-walk starting...\n");
+		fflush(stderr);
+		for (i = filelist_idx; i < argc; i++)
+			prewalk_path(argv[i], &pt);
+		clock_gettime(CLOCK_MONOTONIC, &pt_end);
+		pt_elapsed = (pt_end.tv_sec - pt_start.tv_sec) +
+			     (pt_end.tv_nsec - pt_start.tv_nsec) / 1e9;
+		st.total_files_in_walk = pt.files;
+		st.total_bytes_to_scan = pt.bytes;
+		fprintf(stderr,
+			"lookup: pre-walk complete: %"PRIu64" files, %s total"
+			" (%.1fs)\n",
+			pt.files, pretty_size(pt.bytes), pt_elapsed);
+		fflush(stderr);
+	}
 
 	for (i = filelist_idx; i < argc; i++) {
 		rc = walk_path(argv[i], &st);
