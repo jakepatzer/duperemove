@@ -345,6 +345,7 @@ static void print_progress(struct lookup_state *st, const char *path,
 
 	double files_pct = 0.0;
 	double bytes_pct = 0.0;
+	double dedupe_ratio_pct = 0.0;
 	if (st->total_files_in_walk > 0)
 		files_pct = 100.0 * st->files_visited / st->total_files_in_walk;
 	if (st->total_bytes_to_scan > 0) {
@@ -352,6 +353,16 @@ static void print_progress(struct lookup_state *st, const char *path,
 				      st->bytes_skipped_start_from;
 		bytes_pct = 100.0 * bytes_done / st->total_bytes_to_scan;
 	}
+	/*
+	 * Dedupe ratio: how much of what we've actually scanned ended
+	 * up deduped. Stable across the run (a steady % rather than
+	 * approaching an asymptote like the corpus % does). Excludes
+	 * start-from-skipped bytes from the denominator since those
+	 * never contributed to numerator either.
+	 */
+	if (st->bytes_scanned_total > 0)
+		dedupe_ratio_pct = 100.0 * st->bytes_deduped /
+				   st->bytes_scanned_total;
 
 	/*
 	 * Phase 4/5 visibility on the live progress line:
@@ -369,13 +380,13 @@ static void print_progress(struct lookup_state *st, const char *path,
 	 */
 	if (st->is_tty && !final) {
 		fprintf(stderr,
-			"[lookup] file %"PRIu64"/%"PRIu64" \"%s\" %5.1f%% "
+			"[lookup] file %"PRIu64"/%"PRIu64" \"%-30.30s\" %5.1f%% "
 			"(corpus %5.1f%%f %5.1f%%b) | "
 			"%5.0f MB/s now %5.0f avg | "
 			"cand %"PRIu64" attempts %"PRIu64" ok %"PRIu64" | "
 			"cap_skip %"PRIu64" alias %"PRIu64
 			" seed %"PRIu64" bl %"PRIu64" zero %s | "
-			"deduped %s | %dh%02dm\033[K\r",
+			"deduped %s (%5.1f%%) | %dh%02dm\033[K\r",
 			st->files_visited, st->total_files_in_walk,
 			name,
 			size > 0 ? (100.0 * off / size) : 0.0,
@@ -387,17 +398,17 @@ static void print_progress(struct lookup_state *st, const char *path,
 			st->srccount_seeded,
 			st->h16_blacklist_skipped,
 			zero_buf,
-			deduped_buf,
+			deduped_buf, dedupe_ratio_pct,
 			hrs, mins);
 	} else {
 		fprintf(stderr,
-			"[lookup] file %"PRIu64"/%"PRIu64" \"%s\" %5.1f%% "
+			"[lookup] file %"PRIu64"/%"PRIu64" \"%-30.30s\" %5.1f%% "
 			"(corpus %5.1f%%f %5.1f%%b) | "
 			"%5.0f MB/s now %5.0f avg | "
 			"cand %"PRIu64" attempts %"PRIu64" ok %"PRIu64" | "
 			"cap_skip %"PRIu64" alias %"PRIu64
 			" seed %"PRIu64" bl %"PRIu64" zero %s | "
-			"deduped %s | %dh%02dm\n",
+			"deduped %s (%5.1f%%) | %dh%02dm\n",
 			st->files_visited, st->total_files_in_walk,
 			name,
 			size > 0 ? (100.0 * off / size) : 0.0,
@@ -409,7 +420,7 @@ static void print_progress(struct lookup_state *st, const char *path,
 			st->srccount_seeded,
 			st->h16_blacklist_skipped,
 			zero_buf,
-			deduped_buf,
+			deduped_buf, dedupe_ratio_pct,
 			hrs, mins);
 	}
 	fflush(stderr);
