@@ -1688,7 +1688,14 @@ static void prewalk_maybe_heartbeat(struct prewalk_totals *t)
 	if (t->files - t->last_heartbeat_files < PREWALK_HEARTBEAT_INTERVAL)
 		return;
 	t->last_heartbeat_files = t->files;
-	fprintf(stderr, "lookup: pre-walk %"PRIu64" files, %s total\r",
+	/*
+	 * Newline-terminated regardless of TTY. The TTY-only \r-overwrite
+	 * trick produces a mess in piped log files (each heartbeat
+	 * accumulates as a separate visual line in most editors anyway).
+	 * For a 10M file corpus, 100 heartbeat lines is negligible log
+	 * noise relative to the scan-phase output that follows.
+	 */
+	fprintf(stderr, "lookup: pre-walk %"PRIu64" files, %s total\n",
 		t->files, pretty_size(t->bytes));
 	fflush(stderr);
 }
