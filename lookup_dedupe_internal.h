@@ -116,6 +116,18 @@ struct lookup_state {
 	 */
 	uint64_t	zero_bytes_skipped;
 
+	/*
+	 * Walk position counter. Incremented once for every regular
+	 * file walk_path passes to process_one_file, regardless of
+	 * whether the file ends up processed, skipped as too-small,
+	 * or skipped via --lookup-start-from. The progress line's
+	 * "file N" display uses this rather than the (processed-only)
+	 * sum of n_lookup_files + n_self_files, so the N reflects
+	 * walk position and is stable across runs (assuming directory
+	 * contents and readdir order are stable).
+	 */
+	uint64_t	files_visited;
+
 	struct timespec	start_time;
 	struct timespec	last_progress_time;
 	/*

@@ -364,7 +364,7 @@ static void print_progress(struct lookup_state *st, const char *path,
 			"cap_skip %"PRIu64" alias %"PRIu64
 			" seed %"PRIu64" bl %"PRIu64" zero %s | "
 			"deduped %s | %dh%02dm\033[K\r",
-			st->n_lookup_files + st->n_self_files + 1,
+			st->files_visited,
 			name,
 			size > 0 ? (100.0 * off / size) : 0.0,
 			speed_now_mbs, speed_avg_mbs,
@@ -384,7 +384,7 @@ static void print_progress(struct lookup_state *st, const char *path,
 			"cap_skip %"PRIu64" alias %"PRIu64
 			" seed %"PRIu64" bl %"PRIu64" zero %s | "
 			"deduped %s | %dh%02dm\n",
-			st->n_lookup_files + st->n_self_files + 1,
+			st->files_visited,
 			name,
 			size > 0 ? (100.0 * off / size) : 0.0,
 			speed_now_mbs, speed_avg_mbs,
@@ -608,7 +608,7 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 	 */
 	vprintf("lookup: scanning \"%s\" (%s, file %"PRIu64")\n",
 		path, pretty_size(size),
-		st->n_lookup_files + st->n_self_files + 1);
+		st->files_visited);
 
 	while (off + window_bytes <= size) {
 		unsigned char digests[4][DIGEST_LEN];
@@ -1538,6 +1538,19 @@ static int process_one_file(const char *path, struct stat *sb,
 	int rc;
 	struct file dbfile;
 
+	/*
+	 * Walk-position bookkeeping. Increment FIRST so the displayed
+	 * "file N" number on the progress line reflects this file's
+	 * position in the deterministic walk order. --lookup-start-from
+	 * is applied here too, before any open/stat/classify work, so
+	 * skipped files cost only the readdir+lstat already done by
+	 * walk_path. Numbering remains stable regardless of skip.
+	 */
+	st->files_visited++;
+	if (options.lookup_start_from > 0 &&
+	    st->files_visited <= options.lookup_start_from)
+		return 0;
+
 	fd = open(path, O_RDONLY);
 	if (fd < 0) {
 		eprintf("lookup: open \"%s\": %s\n", path, strerror(errno));
@@ -1757,6 +1770,7 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 						 free, NULL);
 	st.h16_blacklist_skipped = 0;
 	st.zero_bytes_skipped = 0;
+	st.files_visited = 0;
 
 	/*
 	 * Prepare the h16-based lookup statement. Keyed by the 16 KB

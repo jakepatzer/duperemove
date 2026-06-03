@@ -28,4 +28,5 @@ struct options options = {
 	.no_seed_srccount = false,
 	.lookup_fd_cache = 2048,
 	.lookup_progress_interval = 10,
+	.lookup_start_from = 0,
 };

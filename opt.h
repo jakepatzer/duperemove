@@ -106,6 +106,19 @@ struct options {
 	 * 2s emits add up to MB of log per hour).
 	 */
 	uint32_t lookup_progress_interval;
+
+	/*
+	 * --lookup-start-from=N: skip the first N regular files
+	 * encountered during walk_path traversal. The progress
+	 * line's "file N" number reflects walk position, so this
+	 * lets a previously-interrupted run resume by passing the
+	 * last completed file's displayed number. Counts files
+	 * visited (every regular file walk_path enters), not just
+	 * files actually processed - too-small files still bump
+	 * the count so resume numbering matches the prior run's
+	 * walk order.
+	 */
+	uint64_t lookup_start_from;
 };
 
 extern struct options options;

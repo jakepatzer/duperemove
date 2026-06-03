@@ -221,6 +221,7 @@ enum {
 	LOOKUP_FD_CACHE_OPTION,
 	LOOKUP_PROGRESS_INTERVAL_OPTION,
 	BUMP_SRCCOUNT_GEN_OPTION,
+	LOOKUP_START_FROM_OPTION,
 };
 
 static int process_fdupes(void)
@@ -346,6 +347,7 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "lookup-fd-cache", 1, NULL, LOOKUP_FD_CACHE_OPTION },
 		{ "lookup-progress-interval", 1, NULL, LOOKUP_PROGRESS_INTERVAL_OPTION },
 		{ "bump-srccount-gen", 0, NULL, BUMP_SRCCOUNT_GEN_OPTION },
+		{ "lookup-start-from", 1, NULL, LOOKUP_START_FROM_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -515,6 +517,19 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		case BUMP_SRCCOUNT_GEN_OPTION:
 			bump_srccount_gen_opt = 1;
 			break;
+		case LOOKUP_START_FROM_OPTION: {
+			unsigned long long v;
+			char *endp = NULL;
+			v = strtoull(optarg, &endp, 10);
+			if (endp == optarg || *endp != '\0') {
+				eprintf("Error: --lookup-start-from "
+					"must be a non-negative integer "
+					"(got \"%s\").\n", optarg);
+				return EINVAL;
+			}
+			options.lookup_start_from = (uint64_t)v;
+			break;
+		}
 		case HELP_OPTION:
 			help();
 			break;
