@@ -349,8 +349,19 @@ static void print_progress(struct lookup_state *st, const char *path,
 	if (st->total_files_in_walk > 0)
 		files_pct = 100.0 * st->files_visited / st->total_files_in_walk;
 	if (st->total_bytes_to_scan > 0) {
+		/*
+		 * Numerator includes three components: bytes actually
+		 * scanned by stream_blocks, bytes of files skipped via
+		 * --lookup-start-from, and bytes of files skipped as
+		 * too-small-to-dedupe. All three together represent
+		 * "corpus accounted for" - everything our walk has
+		 * either processed or deliberately bypassed. Without
+		 * the too-small term the display would plateau short
+		 * of 100% by the total size of sub-min_dedupe_size files.
+		 */
 		uint64_t bytes_done = st->bytes_scanned_total +
-				      st->bytes_skipped_start_from;
+				      st->bytes_skipped_start_from +
+				      st->bytes_skipped_too_small;
 		bytes_pct = 100.0 * bytes_done / st->total_bytes_to_scan;
 	}
 	/*
@@ -1484,6 +1495,7 @@ static int process_lookup_file(const char *path, int fd, uint64_t size,
 			"match.\n", path, pretty_size(size));
 		close(fd);
 		st->n_too_small_skipped++;
+		st->bytes_skipped_too_small += size;
 		return 0;
 	}
 
@@ -1549,6 +1561,7 @@ static int process_reference_self(const char *path, struct filerec *ref_fr,
 			"--min-dedupe-size); no possible qualifying "
 			"match.\n", path, pretty_size(ref_fr->size));
 		st->n_too_small_skipped++;
+		st->bytes_skipped_too_small += ref_fr->size;
 		return 0;
 	}
 
@@ -1906,6 +1919,7 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	st.total_files_in_walk = 0;
 	st.total_bytes_to_scan = 0;
 	st.bytes_skipped_start_from = 0;
+	st.bytes_skipped_too_small = 0;
 
 	/*
 	 * Prepare the h16-based lookup statement. Keyed by the 16 KB

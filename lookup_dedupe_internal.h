@@ -152,6 +152,19 @@ struct lookup_state {
 	uint64_t	total_bytes_to_scan;
 	uint64_t	bytes_skipped_start_from;
 
+	/*
+	 * bytes_skipped_too_small accumulates the sizes of files that
+	 * reached process_lookup_file / process_reference_self but were
+	 * rejected by the size < min_dedupe_size guard. Files smaller
+	 * than the minimum dedupe window can never contribute to a
+	 * dedupe (the seed would never reach min_dedupe_size after
+	 * extend_match). Without this counter, the bytes-% display
+	 * would plateau short of 100% by the cumulative size of all
+	 * too-small files; with it, the display converges to 100% as
+	 * intended.
+	 */
+	uint64_t	bytes_skipped_too_small;
+
 	struct timespec	start_time;
 	struct timespec	last_progress_time;
 	/*
