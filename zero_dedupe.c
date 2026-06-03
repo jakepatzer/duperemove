@@ -48,12 +48,15 @@
 #endif
 
 /*
- * Tuning constants. SCAN_CHUNK is the pread buffer size; it must be
- * at least 2 * MIN_DEDUPE so any straddling-boundary detection
- * (described in zero_scan_file) has enough lookahead.
+ * Tuning constants. Detection and dedupe both operate at 4 KiB
+ * granularity - every 4 KiB zero block becomes its own dedupe unit.
+ * Contiguous zero blocks are detected by extending the run and
+ * submitted as a single batched FIDEDUPERANGE.
+ *
+ * SCAN_CHUNK is the pread buffer size; large enough to amortize
+ * syscall overhead but bounded for memory safety.
  */
 #define BLOCKSIZE_BYTES		(4UL * 1024UL)		/* 4 KiB */
-#define MIN_DEDUPE_BYTES	(16UL * 1024UL)		/* 16 KiB */
 #define SCAN_CHUNK		(4UL * 1024UL * 1024UL)	/* 4 MiB */
 
 /*
@@ -344,11 +347,11 @@ static int submit_batch(struct zero_state *zs, int dst_fd,
 		return 0;
 
 	same->src_offset = zs->canon.off;
-	same->src_length = MIN_DEDUPE_BYTES;
+	same->src_length = BLOCKSIZE_BYTES;
 	same->dest_count = n;
 	for (i = 0; i < n; i++) {
 		same->info[i].dest_fd = dst_fd;
-		same->info[i].dest_offset = dst_off + (uint64_t)i * MIN_DEDUPE_BYTES;
+		same->info[i].dest_offset = dst_off + (uint64_t)i * BLOCKSIZE_BYTES;
 		same->info[i].bytes_deduped = 0;
 		same->info[i].status = 0;
 	}
@@ -372,9 +375,9 @@ static int submit_batch(struct zero_state *zs, int dst_fd,
 
 	for (i = 0; i < n; i++) {
 		if (same->info[i].status == 0 &&
-		    same->info[i].bytes_deduped == MIN_DEDUPE_BYTES) {
+		    same->info[i].bytes_deduped == BLOCKSIZE_BYTES) {
 			accepted++;
-			zs->bytes_deduped += MIN_DEDUPE_BYTES;
+			zs->bytes_deduped += BLOCKSIZE_BYTES;
 		}
 	}
 	zs->dedupe_calls++;
@@ -486,14 +489,15 @@ static void dedupe_run(struct zero_state *zs, int dst_fd,
 		       const char *path)
 {
 	uint64_t off = run_start;
-	uint64_t total_dedupable = ((run_end - run_start) / MIN_DEDUPE_BYTES) *
-				   MIN_DEDUPE_BYTES;
-	uint64_t end = run_start + total_dedupable;
+	uint64_t end = run_end;
 
 	zs->zero_runs_found++;
 	zs->zero_bytes_found += (run_end - run_start);
 
-	if (total_dedupable == 0)
+	/* Both run_start and run_end are BLOCKSIZE-aligned multiples by
+	 * construction in zero_scan_file, so no rounding is needed.
+	 * Caller already guarantees end > start; defensive guard anyway. */
+	if (end <= off)
 		return;
 
 	/*
@@ -503,22 +507,22 @@ static void dedupe_run(struct zero_state *zs, int dst_fd,
 	 * itself is already at cap. Either way: skip and try the next
 	 * chunk. Hard error: bail on the whole run.
 	 */
-	while (!zs->canon_initialized && off + MIN_DEDUPE_BYTES <= end) {
+	while (!zs->canon_initialized && off + BLOCKSIZE_BYTES <= end) {
 		int ret = adopt_canonical(zs, dst_fd, off);
-		off += MIN_DEDUPE_BYTES;
+		off += BLOCKSIZE_BYTES;
 		if (ret == 0)
 			break;
 		if (ret == EAGAIN)
 			continue;
 		eprintf("zero-dedupe: cannot init canonical in "
 			"\"%s\" @ %"PRIu64": %s\n",
-			path, off - MIN_DEDUPE_BYTES, strerror(ret));
+			path, off - BLOCKSIZE_BYTES, strerror(ret));
 		return;
 	}
 	if (!zs->canon_initialized)
 		return;	/* exhausted run searching for a usable canonical */
 
-	while (off + MIN_DEDUPE_BYTES <= end) {
+	while (off + BLOCKSIZE_BYTES <= end) {
 		uint64_t headroom_refs;
 		uint64_t avail_chunks;
 		unsigned int batch_n;
@@ -533,7 +537,7 @@ static void dedupe_run(struct zero_state *zs, int dst_fd,
 				 * canonical (or other already-shared
 				 * with someone at cap). Skip and try
 				 * the next chunk. */
-				off += MIN_DEDUPE_BYTES;
+				off += BLOCKSIZE_BYTES;
 				continue;
 			}
 			if (ret != 0) {
@@ -542,7 +546,7 @@ static void dedupe_run(struct zero_state *zs, int dst_fd,
 				zs->zero_runs_skipped_no_headroom++;
 				return;
 			}
-			off += MIN_DEDUPE_BYTES;
+			off += BLOCKSIZE_BYTES;
 			continue;
 		}
 
@@ -556,12 +560,12 @@ static void dedupe_run(struct zero_state *zs, int dst_fd,
 		 * check.
 		 */
 		if (dst_fd == zs->canon.fd && off == zs->canon.off) {
-			off += MIN_DEDUPE_BYTES;
+			off += BLOCKSIZE_BYTES;
 			continue;
 		}
 
 		headroom_refs = zs->cap - zs->canon.count;
-		avail_chunks = (end - off) / MIN_DEDUPE_BYTES;
+		avail_chunks = (end - off) / BLOCKSIZE_BYTES;
 		batch_n = (unsigned int)avail_chunks;
 		if (batch_n > MAX_DEDUPES_PER_IOCTL - 1)
 			batch_n = MAX_DEDUPES_PER_IOCTL - 1;
@@ -569,7 +573,7 @@ static void dedupe_run(struct zero_state *zs, int dst_fd,
 			batch_n = (unsigned int)headroom_refs;
 
 		if (batch_n == 0) {
-			off += MIN_DEDUPE_BYTES;
+			off += BLOCKSIZE_BYTES;
 			continue;
 		}
 
@@ -585,7 +589,7 @@ static void dedupe_run(struct zero_state *zs, int dst_fd,
 		if (accepted > 0)
 			zs->canon.count += (uint64_t)accepted;
 
-		off += (uint64_t)batch_n * MIN_DEDUPE_BYTES;
+		off += (uint64_t)batch_n * BLOCKSIZE_BYTES;
 	}
 }
 
@@ -597,7 +601,7 @@ static void dedupe_run(struct zero_state *zs, int dst_fd,
  *
  * blocksize-aligned positions only (matching the main path's
  * 4 KiB-step seed positions). A zero run must be at least
- * MIN_DEDUPE_BYTES to be considered for dedupe.
+ * BLOCKSIZE_BYTES to be considered for dedupe.
  */
 static void zero_scan_file(struct zero_state *zs, const char *path,
 			   int fd, uint64_t size)
@@ -607,7 +611,7 @@ static void zero_scan_file(struct zero_state *zs, const char *path,
 	size_t buf_len = 0;
 	uint64_t file_pos = 0;
 
-	if (size < MIN_DEDUPE_BYTES)
+	if (size < BLOCKSIZE_BYTES)
 		return;
 
 	buf = malloc(SCAN_CHUNK);
@@ -616,7 +620,7 @@ static void zero_scan_file(struct zero_state *zs, const char *path,
 		return;
 	}
 
-	while (file_pos + MIN_DEDUPE_BYTES <= size) {
+	while (file_pos + BLOCKSIZE_BYTES <= size) {
 		size_t in_buf;
 
 		/*
@@ -627,7 +631,7 @@ static void zero_scan_file(struct zero_state *zs, const char *path,
 		 * (c) needed window extends past buffer end.
 		 */
 		if (buf_len == 0 || file_pos < buf_off ||
-		    file_pos + MIN_DEDUPE_BYTES > buf_off + buf_len) {
+		    file_pos + BLOCKSIZE_BYTES > buf_off + buf_len) {
 			size_t want = (size - file_pos < SCAN_CHUNK) ?
 				(size_t)(size - file_pos) : SCAN_CHUNK;
 			ssize_t got = pread(fd, buf, want, file_pos);
@@ -639,7 +643,7 @@ static void zero_scan_file(struct zero_state *zs, const char *path,
 						strerror(errno));
 				break;
 			}
-			if ((size_t)got < MIN_DEDUPE_BYTES) {
+			if ((size_t)got < BLOCKSIZE_BYTES) {
 				/* Short read; can't proceed at this offset.
 				 * Should only happen on signal interruption
 				 * very near EOF. Bail rather than loop. */
@@ -651,7 +655,7 @@ static void zero_scan_file(struct zero_state *zs, const char *path,
 
 		in_buf = (size_t)(file_pos - buf_off);
 
-		if (!buf_is_zero(buf + in_buf, MIN_DEDUPE_BYTES)) {
+		if (!buf_is_zero(buf + in_buf, BLOCKSIZE_BYTES)) {
 			file_pos += BLOCKSIZE_BYTES;
 			zs->bytes_scanned_total += BLOCKSIZE_BYTES;
 			zero_print_progress(zs, path, false);
@@ -664,7 +668,7 @@ static void zero_scan_file(struct zero_state *zs, const char *path,
 		 * chunk boundaries.
 		 */
 		uint64_t run_start = file_pos;
-		uint64_t run_end = file_pos + MIN_DEDUPE_BYTES;
+		uint64_t run_end = file_pos + BLOCKSIZE_BYTES;
 
 		while (run_end + BLOCKSIZE_BYTES <= size) {
 			size_t check_in_buf;
@@ -731,7 +735,7 @@ static int zero_process_one_file(const char *path, struct stat *sb,
 		return 0;
 	}
 
-	if ((uint64_t)sb->st_size < MIN_DEDUPE_BYTES) {
+	if ((uint64_t)sb->st_size < BLOCKSIZE_BYTES) {
 		if (sb->st_size > 0)
 			zs->bytes_skipped_too_small +=
 				(uint64_t)sb->st_size;
@@ -892,9 +896,8 @@ int zero_only_dedupe_main(int argc, char **argv, int filelist_idx)
 		return EINVAL;
 	}
 
-	qprintf("zero-dedupe: cap=%"PRIu64
-		" min_dedupe=%lu blocksize=%lu\n",
-		zs.cap, MIN_DEDUPE_BYTES, BLOCKSIZE_BYTES);
+	qprintf("zero-dedupe: cap=%"PRIu64" blocksize=%lu\n",
+		zs.cap, BLOCKSIZE_BYTES);
 
 	clock_gettime(CLOCK_MONOTONIC, &pt_start);
 	fprintf(stderr, "zero-dedupe: pre-walk starting...\n");
