@@ -318,8 +318,14 @@ static void print_progress(struct lookup_state *st, const char *path,
 	 * was already shown for this file. For files that complete in
 	 * under one throttle window the file is fast enough that the
 	 * end-of-run summary is sufficient; skipping avoids noise.
+	 *
+	 * Also only useful in TTY mode: the in-progress emits use \r
+	 * (no newline) so the next file's content would visually clobber
+	 * the last in-progress line without a final \n. In non-TTY mode
+	 * every emit already ends in \n, so the final-emit is just a
+	 * duplicate line with the same stats - skip it.
 	 */
-	if (final && !st->progress_active)
+	if (final && (!st->progress_active || !st->is_tty))
 		return;
 
 	elapsed_total = (now.tv_sec - st->start_time.tv_sec) +
