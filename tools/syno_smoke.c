@@ -337,7 +337,21 @@ int main(int argc, char **argv)
 	int ret = ioctl(src_fd, BTRFS_IOC_SYNO_EXTENT_SAME, &args);
 	int saved_errno = errno;
 
-	if (ret < 0) {
+	/*
+	 * Per Synology kernel source (reflink.c:1839, btrfs_ioctl_syno_extent_same):
+	 *   if (!ret) {
+	 *       ret = copy_to_user(argp, same, sizeof(*same));
+	 *       if (ret)
+	 *           ret = -EFAULT;
+	 *       else if (same->status)
+	 *           ret = -EMLINK; // this errno should be handled in user space
+	 *   }
+	 *
+	 * So -EMLINK is a SIGNAL that args.status is non-zero, NOT a fatal
+	 * error. The args struct is fully populated when EMLINK is returned —
+	 * we just need to read the status field.
+	 */
+	if (ret < 0 && saved_errno != EMLINK) {
 		fprintf(stderr, "\nioctl returned -1, errno=%d (%s)\n",
 		        saved_errno, strerror(saved_errno));
 		if (saved_errno == ENOTTY || saved_errno == EOPNOTSUPP)
@@ -349,7 +363,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	printf("\n== ioctl returned ret=%d ==\n", ret);
+	if (ret < 0)
+		printf("\n== ioctl returned -1 errno=EMLINK (status field is set; read args) ==\n");
+	else
+		printf("\n== ioctl returned ret=%d ==\n", ret);
 	printf("  status              = %u (%s)\n",
 	       args.status, status_name(args.status));
 	printf("  release_size        = %" PRIu64 " bytes\n",
