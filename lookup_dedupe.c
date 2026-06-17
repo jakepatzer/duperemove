@@ -1324,15 +1324,61 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 			 * below); the rest of the requested range hit a backref-
 			 * saturated src extent. DITTO with kern_bytes == 0 means
 			 * the cap was hit at the very first byte — nothing was
-			 * deduped this call, and the outer loop will re-evaluate.
-			 * Either way these are informational only and don't
-			 * change the bookkeeping logic.
+			 * deduped this call.
+			 *
+			 * Band-aid for the DITTO storm on hot content: on a
+			 * full DITTO (kern_bytes == 0), the kernel told us the
+			 * canonical's physical extent is at backref_limit. Slam
+			 * our DB srccount for the canonical to cap so the next
+			 * encounter of this same canonical short-circuits via
+			 * cap_skip (line ~1145) before re-submitting another
+			 * DITTO-bound ioctl. Without this, hot content where
+			 * 1000+ unaliased candidates all reference the same
+			 * saturated physical extent generates one DITTO per
+			 * candidate. The slam reduces that to one DITTO per
+			 * distinct (canon_fileid, canon_loff) — typically a
+			 * factor of 100-1000x reduction for hot h16s.
+			 *
+			 * Stamps with current_srccount_gen so the value is
+			 * treated as fresh by the outer-skip rule and not
+			 * re-seeded by Phase 5 on next encounter.
+			 *
+			 * canon_fileid > 0 guard: defensive only; resolve_canonical
+			 * only returns positive fileids (blocks_h16 rows all have
+			 * positive fileids). An UPDATE on a non-existent row is a
+			 * silent no-op so the guard is belt-and-suspenders.
 			 */
 			if (syno_status == SYNO_EXTENT_SAME_DITTO) {
-				if (kern_bytes > 0)
+				if (kern_bytes > 0) {
 					st->ditto_partial++;
-				else
+				} else {
 					st->ditto_skipped++;
+
+					if (canon_fileid > 0 &&
+					    options.lookup_max_reflinks > 0) {
+						int64_t cap = (int64_t)
+							options.lookup_max_reflinks;
+						sqlite3_stmt *qs =
+							st->set_srccount_stmt;
+						int rc2;
+
+						sqlite3_reset(qs);
+						sqlite3_bind_int64(qs, 1, cap);
+						sqlite3_bind_int64(qs, 2,
+							canon_fileid);
+						sqlite3_bind_int64(qs, 3,
+							(int64_t)canon_loff);
+						sqlite3_bind_int64(qs, 4,
+							st->current_srccount_gen);
+						rc2 = sqlite3_step(qs);
+						if (rc2 != SQLITE_DONE) {
+							perror_sqlite(rc2,
+								"lookup: ditto "
+								"canon srccount "
+								"slam-to-cap");
+						}
+					}
+				}
 			}
 
 			if (sub_rc == 0 && kern_bytes > 0) {

@@ -92,9 +92,12 @@ struct lookup_state {
 	 *     The prefix is counted toward matches_deduped/bytes_deduped
 	 *     normally; ditto_partial is a separate informational count.
 	 *   ditto_skipped: DITTO returns where the cap was hit at the very
-	 *     first byte, so no bytes were deduped in this call. The outer
-	 *     loop re-evaluates (and userspace cap_skip should catch on
-	 *     next iteration once Phase 5 reseeds srccount).
+	 *     first byte, so no bytes were deduped in this call. On each
+	 *     such event we slam the canonical's srccount to cap (with
+	 *     the current generation) so the next encounter of the same
+	 *     (canon_fileid, canon_loff) cap_skips before re-submitting.
+	 *     This bounds the worst-case DITTO cost to one per distinct
+	 *     canonical rather than one per encounter.
 	 */
 	uint64_t	ditto_partial;
 	uint64_t	ditto_skipped;
