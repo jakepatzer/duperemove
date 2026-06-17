@@ -85,6 +85,21 @@ struct lookup_state {
 						 * back */
 
 	/*
+	 * SYNO_EXTENT_SAME diagnostic counters. Only bumped when
+	 * options.use_syno_dedupe != SYNO_OFF and the SYNO path was used.
+	 *   ditto_partial: DITTO returns where the kernel processed some
+	 *     prefix bytes before hitting a backref-saturated src extent.
+	 *     The prefix is counted toward matches_deduped/bytes_deduped
+	 *     normally; ditto_partial is a separate informational count.
+	 *   ditto_skipped: DITTO returns where the cap was hit at the very
+	 *     first byte, so no bytes were deduped in this call. The outer
+	 *     loop re-evaluates (and userspace cap_skip should catch on
+	 *     next iteration once Phase 5 reseeds srccount).
+	 */
+	uint64_t	ditto_partial;
+	uint64_t	ditto_skipped;
+
+	/*
 	 * Per-run h16 saturation blacklist. An h16 enters the blacklist
 	 * when its candidate list returns 100% cap_skip with zero
 	 * successful dedupes in a seed - i.e., every position in the

@@ -68,6 +68,15 @@ test:
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests.c -o $@ $(LIBRARY_FLAGS)
 	./test
 
+# Standalone smoke test for BTRFS_IOC_SYNO_EXTENT_SAME (tools/syno_smoke.c).
+# Not part of the main build; compiled separately because it has no
+# duperemove/glib/sqlite dependencies and is intended for one-off
+# verification on Synology kernels.
+.PHONY: syno-smoke
+syno-smoke: tools/syno_smoke
+tools/syno_smoke: tools/syno_smoke.c
+	$(CC) -O2 -Wall -Wextra -o $@ $<
+
 install: $(install_progs) $(MANPAGES) $(ZSH_COMPLETION)
 	mkdir -p -m 0755 $(DESTDIR)$(BINDIR)
 	for prog in $(install_progs); do \
@@ -100,6 +109,6 @@ tarball: clean $(DIST_SOURCES)
 	rm -fr $(TEMP_INSTALL_DIR)
 
 clean:
-	rm -fr $(OBJECTS) $(progs) $(DIST_TARBALL) $(DEPENDS) *~
+	rm -fr $(OBJECTS) $(progs) tools/syno_smoke $(DIST_TARBALL) $(DEPENDS) *~
 
 doc: $(MANPAGES)

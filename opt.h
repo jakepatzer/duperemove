@@ -130,6 +130,32 @@ struct options {
 	 * slow-backref pathology on the canonical extent.
 	 */
 	bool zero_only_dedupe;
+
+	/*
+	 * --use-syno-dedupe[=on|auto|off]: controls whether the dedupe
+	 * submission path uses the Synology-native BTRFS_IOC_SYNO_EXTENT_SAME
+	 * ioctl (bypasses DSM 7's compression-mismatch check; provides
+	 * DITTO short-circuit for cap-saturated cases; richer status codes)
+	 * or falls back to upstream FIDEDUPERANGE.
+	 *
+	 *   SYNO_ON   (default): use SYNO ioctl, fatal error if unsupported
+	 *                        by the kernel
+	 *   SYNO_AUTO:          try SYNO first; on ENOTTY/EOPNOTSUPP fall
+	 *                        back silently to FIDEDUPERANGE for the
+	 *                        remainder of the run
+	 *   SYNO_OFF:           always use FIDEDUPERANGE (rollback switch)
+	 *
+	 * Bare --use-syno-dedupe with no =value is treated as =auto.
+	 *
+	 * Only affects the lookup-mode dedupe path (lookup_dedupe.c) and
+	 * the zero-only-dedupe path (zero_dedupe.c). The basic -d mode in
+	 * run_dedupe.c stays on FIDEDUPERANGE regardless of this flag.
+	 */
+	enum syno_dedupe_mode {
+		SYNO_ON = 0,
+		SYNO_AUTO,
+		SYNO_OFF,
+	} use_syno_dedupe;
 };
 
 extern struct options options;

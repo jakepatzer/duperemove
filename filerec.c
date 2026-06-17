@@ -16,16 +16,19 @@
  */
 
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 
 #include "util.h"
 #include "rbtree.h"
 #include "debug.h"
 #include "memstats.h"
 #include "fiemap.h"
+#include "btrfs-util.h"
 
 #include "filerec.h"
 
@@ -271,6 +274,64 @@ void filerec_close(struct filerec *file)
 		file->fd = -1;
 	}
 	g_mutex_unlock(&filerec_fd_mutex);
+}
+
+int filerec_get_btrfs_ids(struct filerec *file,
+			  uint64_t *rootid, uint64_t *objectid)
+{
+	int ret = 0;
+	uint64_t r;
+	struct stat st;
+
+	/*
+	 * Fast path: cache hit. Once populated, these fields don't change
+	 * within a run (file isn't moved between subvolumes, ino doesn't
+	 * change), so reading them without the mutex is safe under x86_64
+	 * memory ordering. The publish happens under the mutex below.
+	 */
+	if (file->btrfs_rootid != 0 && file->btrfs_objectid != 0) {
+		*rootid = file->btrfs_rootid;
+		*objectid = file->btrfs_objectid;
+		return 0;
+	}
+
+	g_mutex_lock(&filerec_fd_mutex);
+
+	/* Re-check after acquiring lock (another thread may have populated). */
+	if (file->btrfs_rootid != 0 && file->btrfs_objectid != 0) {
+		*rootid = file->btrfs_rootid;
+		*objectid = file->btrfs_objectid;
+		goto out;
+	}
+
+	if (file->fd == -1) {
+		/*
+		 * Caller violated the contract: must hold a valid fd via
+		 * filerec_open() or open_once before calling us. We can't
+		 * just open it here because we don't know if the caller
+		 * wants the open refcounted. Surface as EBADF.
+		 */
+		ret = EBADF;
+		goto out;
+	}
+
+	ret = lookup_btrfs_subvol(file->fd, &r);
+	if (ret)
+		goto out;
+
+	if (fstat(file->fd, &st) < 0) {
+		ret = errno;
+		goto out;
+	}
+
+	file->btrfs_rootid = r;
+	file->btrfs_objectid = (uint64_t)st.st_ino;
+	*rootid = file->btrfs_rootid;
+	*objectid = file->btrfs_objectid;
+
+out:
+	g_mutex_unlock(&filerec_fd_mutex);
+	return ret;
 }
 
 void open_once_set_max(struct open_once *open_files, unsigned int max)

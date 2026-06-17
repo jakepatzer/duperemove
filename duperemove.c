@@ -223,6 +223,7 @@ enum {
 	BUMP_SRCCOUNT_GEN_OPTION,
 	LOOKUP_START_FROM_OPTION,
 	ZERO_ONLY_DEDUPE_OPTION,
+	USE_SYNO_DEDUPE_OPTION,
 };
 
 static int process_fdupes(void)
@@ -350,6 +351,11 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		{ "bump-srccount-gen", 0, NULL, BUMP_SRCCOUNT_GEN_OPTION },
 		{ "lookup-start-from", 1, NULL, LOOKUP_START_FROM_OPTION },
 		{ "zero-only-dedupe", 0, NULL, ZERO_ONLY_DEDUPE_OPTION },
+		/*
+		 * --use-syno-dedupe: optional arg (2). Bare flag treats as =auto.
+		 * Accepts "on" | "auto" | "off".
+		 */
+		{ "use-syno-dedupe", 2, NULL, USE_SYNO_DEDUPE_OPTION },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -534,6 +540,28 @@ static int parse_options(int argc, char **argv, int *filelist_idx)
 		}
 		case ZERO_ONLY_DEDUPE_OPTION:
 			options.zero_only_dedupe = true;
+			break;
+		case USE_SYNO_DEDUPE_OPTION:
+			/*
+			 * Bare --use-syno-dedupe (no argument) = SYNO_AUTO.
+			 * --use-syno-dedupe=on   = SYNO_ON (strict, fatal on missing)
+			 * --use-syno-dedupe=auto = SYNO_AUTO (silent fallback)
+			 * --use-syno-dedupe=off  = SYNO_OFF (always FIDEDUPERANGE)
+			 */
+			if (optarg == NULL) {
+				options.use_syno_dedupe = SYNO_AUTO;
+			} else if (strcmp(optarg, "on") == 0) {
+				options.use_syno_dedupe = SYNO_ON;
+			} else if (strcmp(optarg, "auto") == 0) {
+				options.use_syno_dedupe = SYNO_AUTO;
+			} else if (strcmp(optarg, "off") == 0) {
+				options.use_syno_dedupe = SYNO_OFF;
+			} else {
+				eprintf("Error: --use-syno-dedupe value must be "
+					"'on', 'auto', or 'off' (got \"%s\")\n",
+					optarg);
+				return EINVAL;
+			}
 			break;
 		case HELP_OPTION:
 			help();

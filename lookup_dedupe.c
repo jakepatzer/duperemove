@@ -49,6 +49,7 @@
 #include "filerec.h"
 #include "results-tree.h"
 #include "dedupe.h"
+#include "btrfs-syno.h"
 #include "dbfile.h"
 #include "util.h"
 #include "memstats.h"
@@ -92,23 +93,88 @@ static bool block_is_zero(const char *buf, size_t len)
 }
 
 /*
- * Submit a single (source, destination) dedupe pair via a minimal
- * two-extent ctxt. Reuses the existing dedupe_extents() ioctl-chunking
- * path and process_dedupe_results() (which records the (src, dst)
- * high-water on success, gated on options.coalesce). Returns 0 on
- * success or an errno-style error code; *kern_bytes is set to the
- * number of bytes the kernel actually deduped (may be 0 on
- * SAME_DATA_DIFFERS, may be less than len on partial dedupes).
+ * Submit a single (source, destination) dedupe pair. Dispatches to
+ * either the Synology-native BTRFS_IOC_SYNO_EXTENT_SAME ioctl or the
+ * upstream FIDEDUPERANGE path based on options.use_syno_dedupe (and
+ * the runtime g_syno_unavailable flag, which trips on ENOTTY).
+ *
+ * Returns 0 on success or an errno-style error code. *kern_bytes is
+ * set to the number of bytes the kernel actually deduped (may be 0 on
+ * DIFFERS / DITTO-at-start, may be less than len on partial dedupes /
+ * DITTO-mid-range).
+ *
+ * *out_syno_status receives the SYNO enum value when the SYNO path
+ * was used (caller may use this to bump DITTO diagnostic counters);
+ * set to SYNO_EXTENT_SAME_MAX (sentinel) when the FIDEDUPERANGE path
+ * ran. NULL OK if the caller doesn't care.
+ *
+ * Caller's post-success branch (which only fires for *kern_bytes > 0)
+ * works correctly under both paths because both report kern_bytes
+ * consistently (length on full success, truncated prefix on partial).
  */
 static int submit_pair_dedupe(struct filerec *src, uint64_t src_off,
 			      struct filerec *dst, uint64_t dst_off,
-			      uint64_t len, uint64_t *kern_bytes)
+			      uint64_t len, uint64_t *kern_bytes,
+			      int *out_syno_status)
 {
 	struct dedupe_ctxt *ctxt;
 	int ret;
 
 	*kern_bytes = 0;
+	if (out_syno_status)
+		*out_syno_status = SYNO_EXTENT_SAME_MAX;	/* "no SYNO result" */
 
+	/* SYNO path when enabled and available. */
+	if (options.use_syno_dedupe != SYNO_OFF && !g_syno_unavailable) {
+		int syno_status = SYNO_EXTENT_SAME_MAX;
+		uint64_t release_size = 0;
+		uint32_t cap = options.lookup_max_reflinks
+			       ? options.lookup_max_reflinks : 1000;
+
+		ret = syno_dedupe_pair(src, src_off, dst, dst_off, len, cap,
+				       (uint32_t)options.min_dedupe_size,
+				       kern_bytes, &syno_status, &release_size);
+
+		if (ret == 0) {
+			if (out_syno_status)
+				*out_syno_status = syno_status;
+			/*
+			 * coalesce_record is invoked from process_dedupe_results
+			 * on the FIDEDUPERANGE path. The SYNO path doesn't go
+			 * through that machinery, so we replicate the call here
+			 * for kern_bytes > 0 (matching the gating at
+			 * run_dedupe.c:404 — target_status == 0 && target_bytes).
+			 */
+			if (options.coalesce && *kern_bytes > 0)
+				coalesce_record(src->fileid, dst->fileid,
+						dst_off + *kern_bytes);
+			return 0;
+		}
+
+		if (ret == ENOTSUP) {
+			/*
+			 * syno_dedupe_pair already set g_syno_unavailable and
+			 * logged the one-time warning. SYNO_ON treats this as
+			 * fatal (user explicitly asked for strict mode);
+			 * SYNO_AUTO falls through to FIDEDUPERANGE below.
+			 */
+			if (options.use_syno_dedupe == SYNO_ON) {
+				eprintf("lookup: --use-syno-dedupe=on but SYNO ioctl "
+					"is not supported on this kernel. Re-run with "
+					"--use-syno-dedupe=auto (silent fallback) or "
+					"=off (always FIDEDUPERANGE).\n");
+				return ENOTSUP;
+			}
+			/* SYNO_AUTO: fall through to FIDEDUPERANGE path. */
+		} else {
+			/* Real ioctl error: surface as-is (already logged by
+			 * syno_dedupe_pair). */
+			return ret;
+		}
+	}
+
+	/* FIDEDUPERANGE path: explicit --use-syno-dedupe=off, or SYNO_AUTO
+	 * fallback after ENOTTY. */
 	ctxt = new_dedupe_ctxt(2, src_off, len, src);
 	if (ctxt == NULL)
 		return ENOMEM;
@@ -396,7 +462,8 @@ static void print_progress(struct lookup_state *st, const char *path,
 			"%5.0f MB/s now %5.0f avg | "
 			"cand %"PRIu64" attempts %"PRIu64" ok %"PRIu64" | "
 			"cap_skip %"PRIu64" alias %"PRIu64
-			" seed %"PRIu64" bl %"PRIu64" zero %s | "
+			" seed %"PRIu64" bl %"PRIu64
+			" dt %"PRIu64"/%"PRIu64" zero %s | "
 			"deduped %s (%5.1f%%) | %dh%02dm\033[K\r",
 			st->files_visited, st->total_files_in_walk,
 			name,
@@ -408,6 +475,7 @@ static void print_progress(struct lookup_state *st, const char *path,
 			st->cap_skipped, st->alias_already_same,
 			st->srccount_seeded,
 			st->h16_blacklist_skipped,
+			st->ditto_partial, st->ditto_skipped,
 			zero_buf,
 			deduped_buf, dedupe_ratio_pct,
 			hrs, mins);
@@ -418,7 +486,8 @@ static void print_progress(struct lookup_state *st, const char *path,
 			"%5.0f MB/s now %5.0f avg | "
 			"cand %"PRIu64" attempts %"PRIu64" ok %"PRIu64" | "
 			"cap_skip %"PRIu64" alias %"PRIu64
-			" seed %"PRIu64" bl %"PRIu64" zero %s | "
+			" seed %"PRIu64" bl %"PRIu64
+			" dt %"PRIu64"/%"PRIu64" zero %s | "
 			"deduped %s (%5.1f%%) | %dh%02dm\n",
 			st->files_visited, st->total_files_in_walk,
 			name,
@@ -430,6 +499,7 @@ static void print_progress(struct lookup_state *st, const char *path,
 			st->cap_skipped, st->alias_already_same,
 			st->srccount_seeded,
 			st->h16_blacklist_skipped,
+			st->ditto_partial, st->ditto_skipped,
 			zero_buf,
 			deduped_buf, dedupe_ratio_pct,
 			hrs, mins);
@@ -1241,9 +1311,30 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 				continue;
 
 			st->dedupe_attempts++;
+			int syno_status = SYNO_EXTENT_SAME_MAX;
 			sub_rc = submit_pair_dedupe(ref, ref_loff,
 						    file_fr, off, ext_len,
-						    &kern_bytes);
+						    &kern_bytes, &syno_status);
+
+			/*
+			 * DITTO diagnostic counters. Per the Phase 0-verified
+			 * semantics in btrfs-syno.h: DITTO with kern_bytes > 0
+			 * means a prefix was successfully deduped (counts toward
+			 * matches_deduped/bytes_deduped via the standard branch
+			 * below); the rest of the requested range hit a backref-
+			 * saturated src extent. DITTO with kern_bytes == 0 means
+			 * the cap was hit at the very first byte — nothing was
+			 * deduped this call, and the outer loop will re-evaluate.
+			 * Either way these are informational only and don't
+			 * change the bookkeeping logic.
+			 */
+			if (syno_status == SYNO_EXTENT_SAME_DITTO) {
+				if (kern_bytes > 0)
+					st->ditto_partial++;
+				else
+					st->ditto_skipped++;
+			}
+
 			if (sub_rc == 0 && kern_bytes > 0) {
 				uint64_t step;
 
@@ -2146,6 +2237,18 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 		"srccount_seeded: %"PRIu64" canonical(s).\n",
 		st.cap_skipped, st.alias_already_same,
 		st.srccount_seeded);
+
+	/*
+	 * SYNO_EXTENT_SAME diagnostic counters. Only meaningful when
+	 * the SYNO path was used (--use-syno-dedupe != off and the
+	 * kernel supports it). Counters stay at 0 if FIDEDUPERANGE
+	 * was used throughout the run.
+	 */
+	if (st.ditto_partial || st.ditto_skipped)
+		qprintf("lookup: SYNO DITTO: %"PRIu64" partial "
+			"(prefix deduped, then cap-saturated), "
+			"%"PRIu64" full-skip (cap-saturated from start).\n",
+			st.ditto_partial, st.ditto_skipped);
 
 	if ((st.n_lookup_files + st.n_self_files) > 0 &&
 	    st.matches_deduped == 0) {

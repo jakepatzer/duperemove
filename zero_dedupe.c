@@ -28,7 +28,9 @@
 #include <unistd.h>
 
 #include "debug.h"
-#include "dedupe.h"		/* MAX_DEDUPES_PER_IOCTL */
+#include "dedupe.h"		/* MAX_DEDUPES_PER_IOCTL, syno_dedupe_ids */
+#include "btrfs-syno.h"
+#include "btrfs-util.h"
 #include "opt.h"
 #include "util.h"
 #include "zero_dedupe.h"
@@ -74,6 +76,8 @@ struct zero_canon {
 	uint64_t	off;	/* offset within the canonical's file */
 	uint64_t	phys;	/* physical address from FIEMAP */
 	uint64_t	count;	/* current ref count, including this canon's own ref */
+	uint64_t	rootid;	  /* btrfs subvolume id (for SYNO ioctl) */
+	uint64_t	objectid; /* btrfs inode number (for SYNO ioctl) */
 };
 
 struct zero_state {
@@ -313,22 +317,56 @@ static int adopt_canonical(struct zero_state *zs, int fd, uint64_t off)
 	zs->canon.off = off;
 	zs->canon.phys = phys;
 	zs->canon.count = count;
+	zs->canon.rootid = 0;	/* lazy lookup on first SYNO use */
+	zs->canon.objectid = 0;
 	zs->canon_initialized = true;
 	zs->canon_rotations++;
+
+	/*
+	 * Lazy-resolve (rootid, objectid) for the canonical only if SYNO
+	 * mode is in play. Skipping this when --use-syno-dedupe=off avoids
+	 * an extra ioctl + fstat per canonical rotation in the legacy path.
+	 */
+	if (options.use_syno_dedupe != SYNO_OFF && !g_syno_unavailable) {
+		uint64_t rid = 0;
+		struct stat st;
+
+		if (lookup_btrfs_subvol(dup_fd, &rid) == 0 &&
+		    fstat(dup_fd, &st) == 0) {
+			zs->canon.rootid = rid;
+			zs->canon.objectid = (uint64_t)st.st_ino;
+		}
+		/* On failure, IDs stay 0; submit_batch falls back to
+		 * FIDEDUPERANGE for this canonical. */
+	}
+
 	return 0;
 }
 
 /*
- * Submit one batched FIDEDUPERANGE: src is the current canonical,
- * dst entries are N consecutive 16 KiB-aligned positions in (dst_fd)
+ * Submit one batched dedupe: src is the current canonical, dst entries
+ * are N consecutive BLOCKSIZE_BYTES-aligned positions in dst_fd
  * starting at dst_off. Returns the number of entries the kernel
  * accepted (== n on full success), or 0 on error.
+ *
+ * Dispatches by options.use_syno_dedupe:
+ *
+ *   SYNO mode (options.use_syno_dedupe != SYNO_OFF, canon ids resolved,
+ *   g_syno_unavailable not set): issue N sequential pairwise
+ *   syno_dedupe_ids() calls. Pairwise loses the 119:1 batching but
+ *   bypasses the DSM 7 compression-mismatch check. Each call passes
+ *   backref_limit = zs->cap so the kernel will return DITTO once the
+ *   canonical hits cap (we use that as a signal to bail this batch).
+ *
+ *   FIDEDUPERANGE mode (legacy / fallback): one batched ioctl with N
+ *   destinations. Unchanged from the original implementation.
  *
  * Allocates the file_dedupe_range struct on the heap to avoid blowing
  * the stack on large N. The struct is small (about 16 + 24*n bytes)
  * so this is cheap.
  */
 static int submit_batch(struct zero_state *zs, int dst_fd,
+			uint64_t dst_rootid, uint64_t dst_objectid,
 			uint64_t dst_off, unsigned int n)
 {
 	struct file_dedupe_range *same;
@@ -340,6 +378,78 @@ static int submit_batch(struct zero_state *zs, int dst_fd,
 	if (n == 0)
 		return 0;
 
+	/*
+	 * SYNO path: issue N sequential pairwise calls. Cheaper than
+	 * compression-mismatch EINVAL noise; loses batching but each call
+	 * is metadata-bounded (kernel does flush+wait+check_backref_limit
+	 * then either DITTO or proceed).
+	 */
+	if (options.use_syno_dedupe != SYNO_OFF && !g_syno_unavailable &&
+	    zs->canon.rootid != 0 && zs->canon.objectid != 0 &&
+	    dst_rootid != 0 && dst_objectid != 0) {
+		uint64_t kern_bytes = 0;
+		int syno_status = SYNO_EXTENT_SAME_MAX;
+		uint32_t cap32 = zs->cap > UINT32_MAX
+				 ? UINT32_MAX
+				 : (uint32_t)zs->cap;
+
+		for (i = 0; i < n; i++) {
+			uint64_t dst_i = dst_off + (uint64_t)i * BLOCKSIZE_BYTES;
+			int rc;
+
+			kern_bytes = 0;
+			syno_status = SYNO_EXTENT_SAME_MAX;
+			rc = syno_dedupe_ids(zs->canon.fd,
+					     zs->canon.rootid,
+					     zs->canon.objectid,
+					     zs->canon.off,
+					     dst_rootid, dst_objectid, dst_i,
+					     BLOCKSIZE_BYTES,
+					     cap32,
+					     0,	/* min_dedupe_length: irrelevant for single-block */
+					     &kern_bytes, &syno_status, NULL);
+
+			if (rc == ENOTSUP) {
+				/*
+				 * Fall back to FIDEDUPERANGE for the
+				 * REMAINING dst entries in this batch. We've
+				 * already deduped `accepted` of them via SYNO.
+				 * The remaining go through the legacy path.
+				 */
+				break;
+			}
+			if (rc != 0) {
+				/* Real ioctl error; stop this batch. */
+				break;
+			}
+			if (kern_bytes >= BLOCKSIZE_BYTES) {
+				accepted++;
+				zs->bytes_deduped += BLOCKSIZE_BYTES;
+				zs->dedupe_calls++;
+			} else {
+				/*
+				 * DITTO (kern_bytes==0, cap hit on canon),
+				 * DIFF (mismatch — shouldn't happen for
+				 * verified zero blocks), or *_NOT_FOUND.
+				 * Stop this batch: rest of the canonical is
+				 * presumably also saturated or otherwise
+				 * not addable.
+				 */
+				zs->dedupe_calls++;
+				break;
+			}
+		}
+
+		/* If we got at least one accept or it wasn't an ENOTSUP
+		 * fallback, return what we have. */
+		if (accepted > 0 || !g_syno_unavailable)
+			return (int)accepted;
+
+		/* ENOTSUP on the very first call: fall through to
+		 * FIDEDUPERANGE batched path for these N dst entries. */
+	}
+
+	/* FIDEDUPERANGE batched path (legacy / fallback). */
 	same_size = sizeof(*same) +
 		    n * sizeof(struct file_dedupe_range_info);
 	same = calloc(1, same_size);
@@ -485,6 +595,7 @@ static void zero_print_progress(struct zero_state *zs,
  * chance at finding a fresh canonical.
  */
 static void dedupe_run(struct zero_state *zs, int dst_fd,
+		       uint64_t dst_rootid, uint64_t dst_objectid,
 		       uint64_t run_start, uint64_t run_end,
 		       const char *path)
 {
@@ -577,7 +688,9 @@ static void dedupe_run(struct zero_state *zs, int dst_fd,
 			continue;
 		}
 
-		accepted = submit_batch(zs, dst_fd, off, batch_n);
+		accepted = submit_batch(zs, dst_fd,
+					dst_rootid, dst_objectid,
+					off, batch_n);
 		/*
 		 * Whatever the kernel accepted counts toward the
 		 * canonical's ref total. If accepted < batch_n the
@@ -610,6 +723,7 @@ static void zero_scan_file(struct zero_state *zs, const char *path,
 	uint64_t buf_off = 0;	/* file offset of buf[0]; valid iff buf_len>0 */
 	size_t buf_len = 0;
 	uint64_t file_pos = 0;
+	uint64_t dst_rootid = 0, dst_objectid = 0;
 
 	if (size < BLOCKSIZE_BYTES)
 		return;
@@ -618,6 +732,23 @@ static void zero_scan_file(struct zero_state *zs, const char *path,
 	if (!buf) {
 		eprintf("zero-dedupe: out of memory scanning \"%s\"\n", path);
 		return;
+	}
+
+	/*
+	 * Resolve (rootid, objectid) for this dst file once. Only needed
+	 * when SYNO mode is active; submit_batch falls back to FIDEDUPERANGE
+	 * if either id stays 0 (e.g., lookup failed). One BTRFS_IOC_INO_LOOKUP
+	 * + fstat per file, dwarfed by the file's read cost.
+	 */
+	if (options.use_syno_dedupe != SYNO_OFF && !g_syno_unavailable) {
+		struct stat st;
+		uint64_t rid = 0;
+
+		if (lookup_btrfs_subvol(fd, &rid) == 0 &&
+		    fstat(fd, &st) == 0) {
+			dst_rootid = rid;
+			dst_objectid = (uint64_t)st.st_ino;
+		}
 	}
 
 	while (file_pos + BLOCKSIZE_BYTES <= size) {
@@ -699,7 +830,8 @@ static void zero_scan_file(struct zero_state *zs, const char *path,
 			run_end += BLOCKSIZE_BYTES;
 		}
 
-		dedupe_run(zs, fd, run_start, run_end, path);
+		dedupe_run(zs, fd, dst_rootid, dst_objectid,
+			   run_start, run_end, path);
 
 		/* bytes_scanned_total advances by full run length; the
 		 * blocks beyond the dedupable portion (4-12 KiB tail)

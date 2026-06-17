@@ -42,6 +42,19 @@ struct filerec {
 	uint64_t		size;
 	struct rb_root		block_tree;	/* root for hash blocks tree */
 
+	/*
+	 * Cached BTRFS subvolume root id (treeid from BTRFS_IOC_INO_LOOKUP)
+	 * and inode number (objectid = st_ino). Populated lazily by
+	 * filerec_get_btrfs_ids() on first use. 0 means "not yet computed";
+	 * any real subvolume's treeid is >= 5 (FS_TREE = 5,
+	 * BTRFS_FIRST_FREE_OBJECTID = 256), so 0 is a safe sentinel.
+	 * Persists across fd open/close cycles - the (treeid, ino) pair is a
+	 * stable per-file identifier as long as the file isn't moved between
+	 * subvolumes (which we don't expect during a duperemove run).
+	 */
+	uint64_t		btrfs_rootid;
+	uint64_t		btrfs_objectid;
+
 	SLIST_ENTRY(filerec)	rec_list;	/* all filerecs */
 };
 
@@ -55,6 +68,23 @@ struct filerec *filerec_find(int64_t fileid);
 
 int filerec_open(struct filerec *file, bool quiet);
 void filerec_close(struct filerec *file);
+
+/*
+ * Look up (BTRFS subvolume rootid, inode objectid) for a filerec.
+ *
+ * Requires file->fd to be valid (caller must filerec_open() first, or
+ * be inside a path that holds the fd via open_once). Result is cached
+ * in file->btrfs_rootid / file->btrfs_objectid for subsequent calls.
+ *
+ * On success, writes the IDs to *rootid and *objectid and returns 0.
+ * On failure, returns an errno value (typically from BTRFS_IOC_INO_LOOKUP
+ * or fstat) and leaves the cache unmodified.
+ *
+ * Intended for the SYNO_EXTENT_SAME ioctl path which needs (rootid,
+ * objectid) rather than file descriptors.
+ */
+int filerec_get_btrfs_ids(struct filerec *file,
+			  uint64_t *rootid, uint64_t *objectid);
 
 struct open_once {
 	struct rb_root		root;

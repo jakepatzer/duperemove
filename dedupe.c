@@ -29,6 +29,7 @@
 #include "filerec.h"
 #include "dedupe.h"
 #include "debug.h"
+#include "btrfs-syno.h"
 
 /*
  * Used to determine if requests must be aligned with the underlying block size
@@ -364,4 +365,220 @@ int pop_one_dedupe_result(struct dedupe_ctxt *ctxt, int *status,
 	free_dedupe_req(req);
 
 	return !!list_empty(&ctxt->completed);
+}
+
+/*
+ * =============================================================
+ * BTRFS_IOC_SYNO_EXTENT_SAME path (Synology-native pairwise dedupe)
+ * =============================================================
+ *
+ * Separate from the FIDEDUPERANGE dedupe_ctxt machinery above
+ * because SYNO has a fundamentally different API shape:
+ *
+ *   - Pairwise only (1 src + 1 dst per call)
+ *   - Uses (rootid, objectid) not fds
+ *   - Status codes via args.status, signalled via -EMLINK
+ *   - DITTO short-circuit on cap-saturated extents
+ *   - No queue, no batching, no result drain via process_dedupes
+ *
+ * See btrfs-syno.h for the protocol details. Phase 0 smoke test
+ * (tools/syno_smoke.c) verified ABI and behavior on the user's kernel.
+ */
+
+volatile int g_syno_unavailable = 0;
+
+/*
+ * Rate-limited unexpected-status logger. log_count grows monotonically;
+ * we emit when crossing the powers of 10 thresholds (1, 10, 100, 1000...)
+ * so the user sees the first occurrence of each unexpected condition but
+ * isn't drowned by repeats.
+ *
+ * Categories are keyed by status enum value so each unexpected status
+ * gets its own counter and threshold ladder.
+ */
+static unsigned long syno_log_counts[SYNO_EXTENT_SAME_MAX];
+
+static bool syno_should_log(uint8_t status)
+{
+	unsigned long c, n;
+
+	if (status >= SYNO_EXTENT_SAME_MAX)
+		return true;	/* truly weird; log every time */
+
+	c = ++syno_log_counts[status];
+	/* Log at counts that are powers of 10 (1, 10, 100, 1000, ...). */
+	n = c;
+	while (n % 10 == 0)
+		n /= 10;
+	return n == 1;
+}
+
+int syno_dedupe_ids(int ioctl_fd,
+		    uint64_t src_rootid, uint64_t src_objectid, uint64_t src_off,
+		    uint64_t dst_rootid, uint64_t dst_objectid, uint64_t dst_off,
+		    uint64_t length, uint32_t backref_limit,
+		    uint32_t min_dedupe_length,
+		    uint64_t *out_bytes_deduped,
+		    int *out_syno_status,
+		    uint64_t *out_release_size)
+{
+	struct btrfs_ioctl_syno_extent_same_args args;
+	uint64_t kern_bytes = 0;
+	int ret;
+
+	*out_bytes_deduped = 0;
+	*out_syno_status = SYNO_EXTENT_SAME_MAX;	/* sentinel = "no result" */
+	if (out_release_size)
+		*out_release_size = 0;
+
+	if (g_syno_unavailable)
+		return ENOTSUP;
+
+	memset(&args, 0, sizeof(args));
+	args.src_rootid        = src_rootid;
+	args.src_objectid      = src_objectid;
+	args.src_offset        = src_off;
+	args.dst_rootid        = dst_rootid;
+	args.dst_objectid      = dst_objectid;
+	args.dst_offset        = dst_off;
+	args.length            = length;
+	args.min_dedupe_length = min_dedupe_length;
+	args.backref_limit     = backref_limit;
+	/* failed_dst_*, release_size, status zeroed by memset */
+
+	/*
+	 * Issue the ioctl. The kernel uses ioctl_fd only for fs_info
+	 * context and permission checks; src/dst inodes are looked up
+	 * via the (rootid, objectid) tuples in args.
+	 */
+	ret = ioctl(ioctl_fd, BTRFS_IOC_SYNO_EXTENT_SAME, &args);
+
+	if (ret < 0) {
+		int saved_errno = errno;
+
+		/* EMLINK = "args.status holds outcome." NOT a failure. */
+		if (saved_errno == EMLINK)
+			goto interpret_status;
+
+		/* ENOTTY/EOPNOTSUPP = kernel doesn't support this ioctl.
+		 * Flip g_syno_unavailable so subsequent calls short-circuit. */
+		if (saved_errno == ENOTTY || saved_errno == EOPNOTSUPP) {
+			if (!g_syno_unavailable) {
+				g_syno_unavailable = 1;
+				eprintf("syno_dedupe_ids: kernel does not support "
+					"BTRFS_IOC_SYNO_EXTENT_SAME (errno=%d %s); "
+					"falling back to FIDEDUPERANGE for the rest "
+					"of this run.\n",
+					saved_errno, strerror(saved_errno));
+			}
+			return ENOTSUP;
+		}
+
+		eprintf("syno_dedupe_ids: ioctl (src %llu/%llu @ %llu -> "
+			"dst %llu/%llu @ %llu, len %llu): %s (errno %d)\n",
+			(unsigned long long)src_rootid,
+			(unsigned long long)src_objectid,
+			(unsigned long long)src_off,
+			(unsigned long long)dst_rootid,
+			(unsigned long long)dst_objectid,
+			(unsigned long long)dst_off,
+			(unsigned long long)length,
+			strerror(saved_errno), saved_errno);
+		return saved_errno;
+	}
+
+interpret_status:
+	*out_syno_status = args.status;
+	if (out_release_size)
+		*out_release_size = (uint64_t)args.release_size;
+
+	switch (args.status) {
+	case SYNO_EXTENT_SAME_SUCCESS:
+		kern_bytes = length;
+		break;
+
+	case SYNO_EXTENT_SAME_DITTO:
+	case SYNO_EXTENT_SAME_DIFF:
+		if ((uint64_t)args.failed_dst_offset >= dst_off)
+			kern_bytes = (uint64_t)args.failed_dst_offset - dst_off;
+		else
+			kern_bytes = 0;
+		if (args.status == SYNO_EXTENT_SAME_DIFF && kern_bytes == 0 &&
+		    syno_should_log(args.status))
+			eprintf("syno_dedupe_ids: DIFF (mismatch from byte 0) "
+				"src=%llu/%llu@%llu dst=%llu/%llu@%llu len=%llu "
+				"— possible hashfile drift or bitrot.\n",
+				(unsigned long long)src_rootid,
+				(unsigned long long)src_objectid,
+				(unsigned long long)src_off,
+				(unsigned long long)dst_rootid,
+				(unsigned long long)dst_objectid,
+				(unsigned long long)dst_off,
+				(unsigned long long)length);
+		break;
+
+	case SYNO_EXTENT_SAME_SRC_NOT_FOUND:
+	case SYNO_EXTENT_SAME_DST_NOT_FOUND:
+		kern_bytes = 0;
+		if (syno_should_log(args.status))
+			eprintf("syno_dedupe_ids: %s — src=%llu/%llu dst=%llu/%llu\n",
+				args.status == SYNO_EXTENT_SAME_SRC_NOT_FOUND ?
+					"SRC_NOT_FOUND" : "DST_NOT_FOUND",
+				(unsigned long long)src_rootid,
+				(unsigned long long)src_objectid,
+				(unsigned long long)dst_rootid,
+				(unsigned long long)dst_objectid);
+		break;
+
+	default:
+		kern_bytes = 0;
+		eprintf("syno_dedupe_ids: unknown status %u from kernel "
+			"(args.status field corrupted or kernel ABI mismatch)\n",
+			args.status);
+		break;
+	}
+
+	*out_bytes_deduped = kern_bytes;
+	return 0;
+}
+
+int syno_dedupe_pair(struct filerec *src, uint64_t src_off,
+		     struct filerec *dst, uint64_t dst_off,
+		     uint64_t length, uint32_t backref_limit,
+		     uint32_t min_dedupe_length,
+		     uint64_t *out_bytes_deduped,
+		     int *out_syno_status,
+		     uint64_t *out_release_size)
+{
+	uint64_t src_rootid = 0, src_objectid = 0;
+	uint64_t dst_rootid = 0, dst_objectid = 0;
+	int ret;
+
+	*out_bytes_deduped = 0;
+	*out_syno_status = SYNO_EXTENT_SAME_MAX;
+	if (out_release_size)
+		*out_release_size = 0;
+
+	if (g_syno_unavailable)
+		return ENOTSUP;
+
+	ret = filerec_get_btrfs_ids(src, &src_rootid, &src_objectid);
+	if (ret) {
+		eprintf("syno_dedupe_pair: filerec_get_btrfs_ids(src=%s): %s\n",
+			src->filename, strerror(ret));
+		return ret;
+	}
+	ret = filerec_get_btrfs_ids(dst, &dst_rootid, &dst_objectid);
+	if (ret) {
+		eprintf("syno_dedupe_pair: filerec_get_btrfs_ids(dst=%s): %s\n",
+			dst->filename, strerror(ret));
+		return ret;
+	}
+
+	return syno_dedupe_ids(src->fd,
+			       src_rootid, src_objectid, src_off,
+			       dst_rootid, dst_objectid, dst_off,
+			       length, backref_limit, min_dedupe_length,
+			       out_bytes_deduped, out_syno_status,
+			       out_release_size);
 }
