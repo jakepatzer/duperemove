@@ -969,6 +969,7 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 		 * the same h16 skip the SQL lookup + inner loop entirely.
 		 */
 		uint64_t cap_skip_in_seed_at_start = st->cap_skipped;
+		uint64_t ditto_skipped_in_seed_at_start = st->ditto_skipped;
 		bool seed_had_success = false;
 		bool seed_bailed_early = false;
 /*
@@ -1577,7 +1578,28 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 		    cand_in_seed > 0) {
 			uint64_t cap_skips_in_seed =
 				st->cap_skipped - cap_skip_in_seed_at_start;
-			if (cap_skips_in_seed == cand_in_seed) {
+			uint64_t ditto_skips_in_seed =
+				st->ditto_skipped - ditto_skipped_in_seed_at_start;
+			/*
+			 * Treat both cap_skip (canonical's srccount >= cap,
+			 * caught before submission) and ditto_skipped (kernel
+			 * returned DITTO with kern_bytes==0, meaning the
+			 * canonical's physical extent is at backref_limit) as
+			 * "this candidate is saturated."
+			 *
+			 * Including ditto_skipped catches the multi-canonical
+			 * fragmentation case: many distinct (canon_fileid,
+			 * canon_loff) canonicals all referencing the same
+			 * over-saturated physical extent. Each canonical's
+			 * srccount is independent, so cap_skip wouldn't fire,
+			 * but the kernel returns DITTO on every submission.
+			 * Without this branch the seed would never blacklist
+			 * and every future file with the same h16 would re-
+			 * encounter the storm. With it, the first all-DITTO
+			 * seed blacklists and subsequent encounters fast-skip.
+			 */
+			if ((cap_skips_in_seed + ditto_skips_in_seed)
+			    == cand_in_seed) {
 				void *key = malloc(DIGEST_LEN);
 				if (key) {
 					memcpy(key, h16, DIGEST_LEN);
