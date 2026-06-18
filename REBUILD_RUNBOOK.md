@@ -81,11 +81,14 @@ zero-free index, and leaves no stale rows. **Requires the zero-fix binary.**
 # 4a. set the old hashfile aside
 mv /volume1/docker/dedup.hash /volume1/docker/dedup.hash.old
 
-# 4b. scan the masters into a fresh hashfile (CONFIRM these flags match your original build step)
-sudo /volume1/docker/duperemove-patched --hashfile=/volume1/docker/dedup.hash -b 4096 \
+# 4b. PURE BUILD: scan the masters into a fresh hashfile. NO dedupe happens here -
+#     deduping is gated entirely on -d (run_dedupe), which we do not pass. --write-hashes
+#     builds the DB and exits without even running find-dupes (matches the historical build).
+#     CONFIRM the flags match your original build command.
+sudo /volume1/docker/duperemove-patched --write-hashes=/volume1/docker/dedup.hash -b 4096 \
     --skip-zeroes --io-threads=1 -r "/volume2/Archive/Master Final"
 
-# 4c. build the h16 secondary index
+# 4c. SEPARATE STEP: build the h16 secondary index over the now-populated hashfile.
 sudo /volume1/docker/duperemove-patched --hashfile=/volume1/docker/dedup.hash --build-h16-index
 ```
 
