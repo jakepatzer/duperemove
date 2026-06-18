@@ -1170,6 +1170,22 @@ int main(int argc, char **argv)
 
 		qprintf("Hashfile \"%s\" written\n",
 			options.hashfile);
+
+		if (use_hashfile == H_WRITE) {
+			/*
+			 * Auto-build the h16 secondary index as the final step
+			 * of a --write-hashes build, so a single command yields
+			 * a hashfile --lookup-only can use directly (no separate
+			 * --build-h16-index pass). Runs after the covering
+			 * idx_blocks_fileid_loff is in place, so h16_build_index's
+			 * per-file (loff, digest) read is an index-only scan.
+			 * Resumable via blocks_h16_build_progress like the
+			 * standalone command.
+			 */
+			ret = h16_build_index(db);
+			if (ret)
+				goto out;
+		}
 	}
 
 	if (use_hashfile == H_READ || use_hashfile == H_UPDATE)

@@ -418,6 +418,30 @@ static int create_indexes(sqlite3 *db)
 	if (ret)
 		goto out;
 
+	/*
+	 * idx_blocks_fileid_loff is the composite point-lookup index for the
+	 * Phase-4 (fileid, loff) selects in --lookup-only (resolve_canonical /
+	 * srccount). A fileid-only index makes those O(blocks-per-file) on
+	 * large images, so the (fileid, loff) prefix is required for lookup
+	 * performance. The trailing digest makes it a COVERING index for the
+	 * h16 build's "SELECT loff, digest ... WHERE fileid=? ORDER BY loff"
+	 * (index-only scan: no external sort, no per-row table reads).
+	 * Unlike idx_blocks_fileid it thrashes during the scan
+	 * exactly like the digest index (loff is scrambled by the pre-INSERT
+	 * digest sort), so it rides the same bulk-load skip flag: skipped here
+	 * during the scan, dropped by dbfile_drop_bulk_load_indexes(), and
+	 * rebuilt in one sorted pass by dbfile_create_bulk_load_indexes()
+	 * after scan_files() completes.
+	 */
+#define CREATE_BLOCKS_FILEID_LOFF_INDEX \
+"create index if not exists idx_blocks_fileid_loff on blocks(fileid, loff, digest);"
+	if (!dbfile_skip_digest_index_creation) {
+		ret = sqlite3_exec(db, CREATE_BLOCKS_FILEID_LOFF_INDEX,
+				   NULL, NULL, NULL);
+		if (ret)
+			goto out;
+	}
+
 #define CREATE_EXTENTS_DIGEST_LEN_INDEX					\
 "create index if not exists idx_extents_digest_len on extents(digest, len);"
 	if (!dbfile_skip_digest_index_creation) {
@@ -520,6 +544,11 @@ int dbfile_drop_bulk_load_indexes(sqlite3 *db)
 	if (ret)
 		goto out;
 
+	ret = sqlite3_exec(db, "drop index if exists idx_blocks_fileid_loff;",
+			   NULL, NULL, NULL);
+	if (ret)
+		goto out;
+
 	ret = sqlite3_exec(db, "drop index if exists idx_extents_digest_len;",
 			   NULL, NULL, NULL);
 out:
@@ -533,6 +562,10 @@ int dbfile_create_bulk_load_indexes(sqlite3 *db)
 	int ret;
 
 	ret = sqlite3_exec(db, CREATE_BLOCKS_DIGEST_INDEX, NULL, NULL, NULL);
+	if (ret)
+		goto out;
+
+	ret = sqlite3_exec(db, CREATE_BLOCKS_FILEID_LOFF_INDEX, NULL, NULL, NULL);
 	if (ret)
 		goto out;
 

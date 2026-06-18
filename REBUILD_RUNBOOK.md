@@ -81,15 +81,20 @@ zero-free index, and leaves no stale rows. **Requires the zero-fix binary.**
 # 4a. set the old hashfile aside
 mv /volume1/docker/dedup.hash /volume1/docker/dedup.hash.old
 
-# 4b. PURE BUILD: scan the masters into a fresh hashfile. NO dedupe happens here -
-#     deduping is gated entirely on -d (run_dedupe), which we do not pass. --write-hashes
-#     builds the DB and exits without even running find-dupes (matches the historical build).
-#     CONFIRM the flags match your original build command.
-sudo /volume1/docker/duperemove-patched --write-hashes=/volume1/docker/dedup.hash -b 4096 \
-    --skip-zeroes --io-threads=1 -r "/volume2/Archive/Master Final"
+# 4b. ONE COMMAND: scan masters -> blocks + covering indexes + h16 index, all automatic.
+#     NO dedupe (gated on -d, not passed). --write-hashes now auto-builds the h16 secondary
+#     index at the end, so no separate --build-h16-index pass is needed. The covering
+#     idx_blocks_fileid_loff(fileid, loff, digest) is built once at the very end (bulk-load
+#     pattern) and makes both the Phase-4 (fileid,loff) lookups and the h16 build fast
+#     (index-only scan). SQLITE_TMPDIR must be set (sudo -E strips it) for the end-of-build
+#     index sorts. Use a moderate --io-threads (~2-4) to overlap HDD reads with hashing; the
+#     build does no dedupe/LOGICAL_INO, so multi-threading is safe.
+sudo SQLITE_TMPDIR=/volume1/docker/dedup-tmp /volume1/docker/duperemove-patched \
+    --write-hashes=/volume1/docker/dedup.hash -b 4096 --skip-zeroes --io-threads=4 \
+    -r "/volume2/Archive/Master Final"
 
-# 4c. SEPARATE STEP: build the h16 secondary index over the now-populated hashfile.
-sudo /volume1/docker/duperemove-patched --hashfile=/volume1/docker/dedup.hash --build-h16-index
+# (The standalone --build-h16-index still exists for rebuilding the h16 index by itself,
+#  but is no longer needed in the normal build flow.)
 ```
 
 ---
