@@ -158,27 +158,39 @@ static void prepare_screen_area(void)
 	s_save_pos()
 }
 
-static void *print_progress(void)
+static void print_progress(int do_print)
 {
 	files_scanned = 0;
 	bytes_scanned = 0;
 
-	s_restore_pos();
+	if (do_print)
+		s_restore_pos();
 
 	for (unsigned int i = 0; i < pscan.thread_count; i++) {
-		print_thread_progress(pscan.threads[i]);
+		if (do_print)
+			print_thread_progress(pscan.threads[i]);
 		files_scanned += pscan.threads[i]->total_scanned_files;
 		bytes_scanned += pscan.threads[i]->total_scanned_bytes;
 	}
 
-	print_total_progress();
-
-	return NULL;
+	if (do_print)
+		print_total_progress();
 }
 
 static void *pscan_progress_thread(void * p)
 {
 	struct winsize w;
+	/*
+	 * Non-tty mode ticks once per second and each print_progress() emits a
+	 * full multi-line block, which floods a piped/tee'd log. Throttle
+	 * emission to one block every --lookup-progress-interval seconds
+	 * (reused here as a general progress cadence; default 10s) while still
+	 * recomputing the totals every tick so the loop-exit condition below
+	 * stays responsive. tty mode is unchanged (in-place refresh ~100ms).
+	 */
+	unsigned int emit_every = (!tty && options.lookup_progress_interval)
+				  ? options.lookup_progress_interval : 1;
+	unsigned int tick = 0;
 	do {
 		/* Refresh the tty properties */
 		if (tty) {
@@ -189,8 +201,9 @@ static void *pscan_progress_thread(void * p)
 		}
 
 		g_mutex_lock(&pscan.mutex);
-		print_progress();
+		print_progress(tty || (tick % emit_every) == 0);
 		g_mutex_unlock(&pscan.mutex);
+		tick++;
 
 		/* Do not waste too much cpu */
 		usleep(1000 * (tty ? 100 : 1000));
@@ -306,9 +319,10 @@ void pscan_printf(char *fmt, ...)
 	 * We reprint the progress immediately to reduce
 	 * the time during which the screen is left empty:
 	 * between the prepare_screen_area() and the progress_thread()'s
-	 * next iteration.
+	 * next iteration. Only meaningful in tty mode (in-place refresh);
+	 * non-tty just recomputes totals without emitting an extra block.
 	 */
-	print_progress();
+	print_progress(tty);
 	g_mutex_unlock(&pscan.mutex);
 }
 
