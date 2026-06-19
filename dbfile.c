@@ -613,12 +613,15 @@ static int dbfile_set_modes(sqlite3 *db)
 	 * smaller than the per-file index working set at our scale
 	 * (1 TB file -> ~8 GB digest index, ~2 GB even for 250 GB),
 	 * which produced severe cache thrash and runaway WAL growth
-	 * during the per-file commit. 4 GiB comfortably absorbs the
-	 * working set for sub-TB files and substantially helps the
-	 * larger ones, while staying well inside the per-thread RAM
-	 * budget alongside the per-file scan buffer.
+	 * during the per-file commit. Kept modest (512 MiB) on purpose:
+	 * the per-file block-digest array is sized to the whole file
+	 * (~24 B/block => ~5.4 GiB for a ~1 TB image), so a large SQLite
+	 * cache stacked on top of that array (times --io-threads) is what
+	 * OOM-kills the build on multi-hundred-GB files. 512 MiB just spills
+	 * the commit's working set to the WAL (paced by vm.dirty_bytes)
+	 * instead of pinning it in anonymous RAM.
 	 */
-	ret = sqlite3_exec(db, "PRAGMA cache_size = -4000000", NULL, NULL, NULL);
+	ret = sqlite3_exec(db, "PRAGMA cache_size = -524288", NULL, NULL, NULL);
 	if (ret) {
 		perror_sqlite(ret, "configuring database (cache size)");
 		return ret;
