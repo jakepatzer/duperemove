@@ -82,15 +82,20 @@ zero-free index, and leaves no stale rows. **Requires the zero-fix binary.**
 mv /volume1/docker/dedup.hash /volume1/docker/dedup.hash.old
 
 # 4b. ONE COMMAND: scan masters -> blocks + covering indexes + h16 index, all automatic.
-#     NO dedupe (gated on -d, not passed). --write-hashes now auto-builds the h16 secondary
-#     index at the end, so no separate --build-h16-index pass is needed. The covering
-#     idx_blocks_fileid_loff(fileid, loff, digest) is built once at the very end (bulk-load
-#     pattern) and makes both the Phase-4 (fileid,loff) lookups and the h16 build fast
-#     (index-only scan). SQLITE_TMPDIR must be set (sudo -E strips it) for the end-of-build
-#     index sorts. Use a moderate --io-threads (~2-4) to overlap HDD reads with hashing; the
-#     build does no dedupe/LOGICAL_INO, so multi-threading is safe.
+#     REQUIRED: --dedupe-options=partial. This enables block-level hashing (do_block_hash);
+#     WITHOUT it the blocks table stays EMPTY (only extent hashes are stored) and the h16
+#     build inserts 0 rows -- the whole h16/lookup pipeline depends on the blocks table.
+#     NO dedupe happens (gated on -d, not passed). --write-hashes auto-builds the h16
+#     secondary index at the end, so no separate --build-h16-index pass is needed. The
+#     covering idx_blocks_fileid_loff(fileid, loff, digest) is built once at the very end
+#     (bulk-load pattern) and makes both the Phase-4 (fileid,loff) lookups and the h16 build
+#     fast (index-only scan). SQLITE_TMPDIR must be set (sudo -E strips it) for the
+#     end-of-build index sorts. Moderate --io-threads (~2-4) overlaps HDD reads with hashing;
+#     the build does no dedupe/LOGICAL_INO so multi-threading is safe.
+#     --lookup-progress-interval throttles the non-tty progress block (default 10s).
 sudo SQLITE_TMPDIR=/volume1/docker/dedup-tmp /volume1/docker/duperemove-patched \
-    --write-hashes=/volume1/docker/dedup.hash -b 4096 --skip-zeroes --io-threads=4 \
+    --write-hashes=/volume1/docker/dedup.hash -b 4096 --dedupe-options=partial \
+    --skip-zeroes --io-threads=2 --lookup-progress-interval=30 \
     -r "/volume2/Archive/Master Final"
 
 # (The standalone --build-h16-index still exists for rebuilding the h16 index by itself,
