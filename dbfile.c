@@ -1042,17 +1042,20 @@ struct dbhandle *dbfile_open_handle_readonly(char *filename)
 	 * demand-loaded memory accesses (no pread syscall, no copy
 	 * from page cache to SQLite cache) which is a measurable win
 	 * for the random-access pattern of idx_blocks_digest lookups
-	 * during --lookup-only. 100 GB is sized to cover the current
-	 * production hashfile (~95 GB); on x64 Linux this only
-	 * reserves address space, it does not pin physical RAM - the
-	 * kernel pages in on demand and evicts under pressure.
+	 * during --lookup-only. 300 GB is sized to cover the whole
+	 * post-h16 hashfile (~200 GB and growing); a too-small mmap_size
+	 * leaves the tail of the file on the slower pread+copy path.
+	 * On x64 Linux this only reserves ADDRESS SPACE, it does not pin
+	 * physical RAM - the kernel pages in on demand and evicts clean
+	 * file-backed pages first under pressure, so it cannot OOM and
+	 * does not compete with the anonymous skip-caches for RSS.
 	 *
 	 * Non-fatal on failure: SQLite transparently falls back to
 	 * pread per-file if mmap is unavailable or fails. We log the
 	 * failure for diagnosis but don't abort the open.
 	 */
 	ret = sqlite3_exec(result->db,
-			   "PRAGMA mmap_size = 100000000000",
+			   "PRAGMA mmap_size = 300000000000",
 			   NULL, NULL, NULL);
 	if (ret) {
 		perror_sqlite(ret,

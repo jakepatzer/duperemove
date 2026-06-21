@@ -303,6 +303,87 @@ static gboolean h16_equal_func(gconstpointer a, gconstpointer b)
 	return memcmp(a, b, DIGEST_LEN) == 0;
 }
 
+/*
+ * Bounded insert for the in-memory skip-caches. See the header for why
+ * whole-table clearing is correctness-safe. We clear-then-insert so the
+ * table never exceeds cap and the just-learned entry survives the clear
+ * (avoiding an immediate re-clear churn loop on the next insert).
+ */
+void bounded_skipcache_insert(GHashTable *t, gpointer key, gpointer val,
+			      guint cap)
+{
+	if (g_hash_table_size(t) >= cap)
+		g_hash_table_remove_all(t);
+	g_hash_table_insert(t, key, val);
+}
+
+/*
+ * Pack a (fileid, loff) pair into a single pointer-sized key for the
+ * direct-hashed skip-caches. loff is block-aligned, so we drop the low
+ * 12 bits (4 KiB granularity is finer than any blocksize we support).
+ * Layout (64-bit): [ fileid : 24 ][ loff>>12 : 40 ]. Ranges: fileid up
+ * to ~16.7M (corpus has ~224k files), loff up to 2^52 = 4 PiB. If either
+ * field exceeds its range we return false and the caller simply does not
+ * cache that entry - a correctness-preserving fallback, never a wrong key.
+ * Both fileid and loff are guaranteed >= 0 here (blocks_h16 fileids are
+ * positive; loff is a file offset).
+ */
+static bool skipcache_pack_key(int64_t fileid, uint64_t loff, gpointer *out)
+{
+	uint64_t f = (uint64_t)fileid;
+	uint64_t l = loff >> 12;
+
+	if (fileid < 0 || f >= (UINT64_C(1) << 24) || l >= (UINT64_C(1) << 40))
+		return false;
+	/*
+	 * The packed value is used purely as an opaque hash key, never
+	 * dereferenced, so stuffing an integer into a pointer is safe on
+	 * LP64 (the only target; SQLite mmap path already assumes x64).
+	 */
+	*out = (gpointer)(uintptr_t)((f << 40) | l);
+	return true;
+}
+
+/*
+ * Record a confirmed cap_skip of candidate (ref_id, ref_loff): add it to
+ * the per-candidate cap-skip cache (so future seeds skip the resolve SQL)
+ * and, while the cursor prefix is still open, advance the high-water mark.
+ * Both are pure performance state; see lookup_dedupe_internal.h. Caller
+ * passes prefix_open by value (read-only) and the prefix accumulators by
+ * pointer.
+ */
+static void note_cap_skip(struct lookup_state *st, int64_t ref_id,
+			  uint64_t ref_loff, bool prefix_open,
+			  bool *prefix_set, int64_t *prefix_cf,
+			  uint64_t *prefix_cl)
+{
+	gpointer ck;
+
+	if (prefix_open) {
+		/*
+		 * Still inside the leading cap_skip prefix: the cursor will
+		 * exclude this position from the next seed's query, so caching
+		 * it in capskip_cand would be dead weight that only speeds up
+		 * the clear-on-full churn. Just advance the high-water mark.
+		 */
+		*prefix_cf = ref_id;
+		*prefix_cl = ref_loff;
+		*prefix_set = true;
+		return;
+	}
+	/*
+	 * Interior cap_skip (prefix already closed). The cursor cannot
+	 * represent this one, so the per-candidate cache is what saves the
+	 * resolve_canonical SQL on a future re-encounter.
+	 */
+	if (skipcache_pack_key(ref_id, ref_loff, &ck))
+		bounded_skipcache_insert(st->capskip_cand, ck,
+					 GINT_TO_POINTER(1), SKIPCACHE_CAND_MAX);
+	(void)prefix_set;
+	(void)prefix_cf;
+	(void)prefix_cl;
+}
+
 #define CHECKPOINT_INTERVAL_SEC 300.0
 static void maybe_checkpoint(struct lookup_state *st)
 {
@@ -463,7 +544,8 @@ static void print_progress(struct lookup_state *st, const char *path,
 			"cand %"PRIu64" attempts %"PRIu64" ok %"PRIu64" | "
 			"cap_skip %"PRIu64" alias %"PRIu64
 			" seed %"PRIu64" bl %"PRIu64
-			" dt %"PRIu64"/%"PRIu64" zero %s | "
+			" dt %"PRIu64"/%"PRIu64
+			" cc %"PRIu64" ps %"PRIu64" csz %u/%u/%u zero %s | "
 			"deduped %s (%5.1f%%) | %dh%02dm\033[K\r",
 			st->files_visited, st->total_files_in_walk,
 			name,
@@ -476,6 +558,10 @@ static void print_progress(struct lookup_state *st, const char *path,
 			st->srccount_seeded,
 			st->h16_blacklist_skipped,
 			st->ditto_partial, st->ditto_skipped,
+			st->cand_cache_skipped, st->phys_cache_skipped,
+			(unsigned)g_hash_table_size(st->capskip_cand),
+			(unsigned)g_hash_table_size(st->phys_saturated),
+			(unsigned)g_hash_table_size(st->h16_cursor),
 			zero_buf,
 			deduped_buf, dedupe_ratio_pct,
 			hrs, mins);
@@ -487,7 +573,8 @@ static void print_progress(struct lookup_state *st, const char *path,
 			"cand %"PRIu64" attempts %"PRIu64" ok %"PRIu64" | "
 			"cap_skip %"PRIu64" alias %"PRIu64
 			" seed %"PRIu64" bl %"PRIu64
-			" dt %"PRIu64"/%"PRIu64" zero %s | "
+			" dt %"PRIu64"/%"PRIu64
+			" cc %"PRIu64" ps %"PRIu64" csz %u/%u/%u zero %s | "
 			"deduped %s (%5.1f%%) | %dh%02dm\n",
 			st->files_visited, st->total_files_in_walk,
 			name,
@@ -500,6 +587,10 @@ static void print_progress(struct lookup_state *st, const char *path,
 			st->srccount_seeded,
 			st->h16_blacklist_skipped,
 			st->ditto_partial, st->ditto_skipped,
+			st->cand_cache_skipped, st->phys_cache_skipped,
+			(unsigned)g_hash_table_size(st->capskip_cand),
+			(unsigned)g_hash_table_size(st->phys_saturated),
+			(unsigned)g_hash_table_size(st->h16_cursor),
 			zero_buf,
 			deduped_buf, dedupe_ratio_pct,
 			hrs, mins);
@@ -942,6 +1033,27 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 		}
 
 		/*
+		 * Fix A cursor bind: resume past this h16's recorded cap_skip
+		 * prefix. (0,0) when none recorded -> full list (all blocks_h16
+		 * fileids are >= 1, so (fileid,loff) > (0,0) matches everything).
+		 */
+		{
+			int64_t cur_cf = 0;
+			int64_t cur_cl = 0;
+			gpointer cval;
+			if (g_hash_table_lookup_extended(st->h16_cursor, h16,
+							 NULL, &cval)) {
+				uint64_t packed = (uint64_t)(uintptr_t)cval;
+				cur_cf = (int64_t)(packed >> 40);
+				cur_cl = (int64_t)((packed &
+					((UINT64_C(1) << 40) - 1)) << 12);
+				st->cursor_applied++;
+			}
+			sqlite3_bind_int64(stmt, 2, cur_cf);
+			sqlite3_bind_int64(stmt, 3, cur_cl);
+		}
+
+		/*
 		 * Per-seed candidate safety cap + heartbeat. Without
 		 * these, a single seed with a pathologically large
 		 * h16-collision set (e.g., common boot-sector pattern
@@ -972,6 +1084,24 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 		uint64_t ditto_skipped_in_seed_at_start = st->ditto_skipped;
 		bool seed_had_success = false;
 		bool seed_bailed_early = false;
+		/*
+		 * Fix A cursor tracking. cap_prefix_open stays true only while
+		 * we are still inside the contiguous LEADING run of cap_skipped
+		 * candidates for this seed. It is cleared the moment any
+		 * candidate is skipped for a dst-DEPENDENT reason (self /
+		 * coalesce / gap / alias) or proceeds past the cap, because
+		 * such a candidate is NOT a dst-independent cap_skip and the
+		 * cursor must never advance past it (a different dst could find
+		 * it viable). cap_prefix_{cf,cl} hold the (fileid,loff) of the
+		 * last cap_skip while the prefix was still open; stored to
+		 * h16_cursor at seed end so the next seed of this h16 resumes
+		 * past it. Monotonic: the query already resumed past the old
+		 * cursor, so any cap_skip this seed is strictly greater.
+		 */
+		bool cap_prefix_open = true;
+		bool cap_prefix_set = false;
+		int64_t cap_prefix_cf = 0;
+		uint64_t cap_prefix_cl = 0;
 /*
  * Safety cap on per-seed candidate iterations. With the outer-loop
  * dst-alias hoist, the realistic worst case for a single seed is
@@ -1024,10 +1154,38 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 			 * is what prevents a position from "matching"
 			 * itself.
 			 */
-			if (ref_id == file_fr->fileid && ref_loff == off)
+			if (ref_id == file_fr->fileid && ref_loff == off) {
+				cap_prefix_open = false;
 				continue;
+			}
 
 			st->seed_matches_found++;
+
+			/*
+			 * Fix A part 1: per-candidate cap-skip cache. A candidate
+			 * position that cap_skipped before will cap_skip again
+			 * (canonical saturation is monotonic within a run), so
+			 * short-circuit the resolve_canonical SQL point-lookup.
+			 * Counts as a cap_skip and advances the cursor prefix
+			 * exactly as the full path would. Placed after the self
+			 * check (self takes precedence) but before the coalesce/
+			 * gap pre-checks, since a dst-independent cap_skip
+			 * subsumes those dst-dependent ones.
+			 */
+			{
+				gpointer ck;
+				if (skipcache_pack_key(ref_id, ref_loff, &ck) &&
+				    g_hash_table_contains(st->capskip_cand, ck)) {
+					st->cap_skipped++;
+					st->cand_cache_skipped++;
+					if (cap_prefix_open) {
+						cap_prefix_cf = ref_id;
+						cap_prefix_cl = ref_loff;
+						cap_prefix_set = true;
+					}
+					continue;
+				}
+			}
 
 			/*
 			 * Per (src, dst) high-water suppression. Done
@@ -1042,8 +1200,10 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 			 * dedupe.
 			 */
 			if (options.coalesce &&
-			    coalesce_covered(ref_id, file_fr->fileid, off))
+			    coalesce_covered(ref_id, file_fr->fileid, off)) {
+				cap_prefix_open = false;
 				continue;
+			}
 
 			/*
 			 * Same-file gap pre-check. For a within-file
@@ -1065,8 +1225,10 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 			    ref_id == file_fr->fileid) {
 				uint64_t gap = (ref_loff > off) ?
 					(ref_loff - off) : (off - ref_loff);
-				if (gap < options.min_dedupe_size)
+				if (gap < options.min_dedupe_size) {
+					cap_prefix_open = false;
 					continue;
+				}
 			}
 
 			/*
@@ -1145,6 +1307,9 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 				int64_t cap = (int64_t)options.lookup_max_reflinks;
 				if (canon_srccount >= cap) {
 					st->cap_skipped++;
+					note_cap_skip(st, ref_id, ref_loff,
+						cap_prefix_open, &cap_prefix_set,
+						&cap_prefix_cf, &cap_prefix_cl);
 					continue;
 				}
 			}
@@ -1201,9 +1366,22 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 					0 : canon_srccount;
 				if (effective >= cap) {
 					st->cap_skipped++;
+					note_cap_skip(st, ref_id, ref_loff,
+						cap_prefix_open, &cap_prefix_set,
+						&cap_prefix_cf, &cap_prefix_cl);
 					continue;
 				}
 			}
+
+			/*
+			 * This candidate passed the cap and is going to be tried
+			 * for a real dedupe (or skipped for a dst-dependent reason
+			 * like alias migration below). Either way it is NOT a
+			 * dst-independent cap_skip, so close the cursor prefix: the
+			 * cursor must never advance past a position a different dst
+			 * might find viable.
+			 */
+			cap_prefix_open = false;
 
 			/*
 			 * Multi-pass safety + reflink-migration suppression.
@@ -1378,6 +1556,29 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 								"canon srccount "
 								"slam-to-cap");
 						}
+					}
+
+					/*
+					 * Fix B populate from the kernel's own verdict. A
+					 * full DITTO means the SOURCE physical extent (ref
+					 * @ ref_loff) is at backref_limit. Record its
+					 * physical address so future fresh candidates that
+					 * resolve to the same extent short-circuit Phase 5
+					 * and never re-submit. Catches the per-(fileid,loff)
+					 * -vs-physical-extent divergence where the seed read
+					 * < cap but the kernel rejected the extent. FIEMAP
+					 * failure is non-fatal: just don't cache this one.
+					 */
+					{
+						uint64_t dphys = 0;
+						if (fiemap_physical_addr(ref->fd, ref_loff,
+									 &dphys) == 0 &&
+						    dphys != 0)
+							bounded_skipcache_insert(
+								st->phys_saturated,
+								GSIZE_TO_POINTER(dphys),
+								GINT_TO_POINTER(1),
+								SKIPCACHE_PHYS_MAX);
 					}
 				}
 			}
@@ -1565,6 +1766,52 @@ static int stream_blocks(const char *path, struct filerec *file_fr,
 			}
 		}
 		sqlite3_reset(stmt);
+
+		/*
+		 * Fix A cursor store. Persist this h16's contiguous cap_skip
+		 * prefix high-water so the next seed of the same h16 resumes
+		 * past it (and a seed that bailed at MAX_CAND_PER_SEED makes
+		 * forward progress instead of re-scanning from 0 - which is
+		 * also what lets super-hot h16s ever reach the viable
+		 * candidates beyond the 1M cap). The mark only advances: the
+		 * query already started past the old cursor, so cap_prefix_*
+		 * is strictly greater. g_hash_table_insert frees the passed
+		 * key if the h16 already exists, so re-storing never leaks.
+		 * Skip if the (fileid,loff) does not fit the packing (rare;
+		 * just means no cursor for this h16 - safe).
+		 */
+		if (cap_prefix_set) {
+			gpointer packed;
+			if (skipcache_pack_key(cap_prefix_cf, cap_prefix_cl,
+					       &packed)) {
+				/*
+				 * Freeze-when-full (NOT clear-on-full) for the
+				 * cursor: always update an EXISTING h16 (that is
+				 * the monotonic advance of a hot cursor), but
+				 * only ADD a new h16 while there is room. Wiping
+				 * the whole table would reset hot cursors to 0,
+				 * causing them to re-bail at MAX_CAND_PER_SEED
+				 * and lose the dedupe-reach this fix provides -
+				 * worse than baseline. Freezing instead just
+				 * denies a cursor to new (cold) h16s once full;
+				 * those fall back to scanning from 0, which is
+				 * exactly baseline behavior. g_hash_table_insert
+				 * frees the passed key on an existing-h16 update,
+				 * so no leak.
+				 */
+				if (g_hash_table_size(st->h16_cursor) <
+					SKIPCACHE_CURSOR_MAX ||
+				    g_hash_table_contains(st->h16_cursor, h16)) {
+					void *key = malloc(DIGEST_LEN);
+					if (key) {
+						memcpy(key, h16, DIGEST_LEN);
+						g_hash_table_insert(
+							st->h16_cursor, key,
+							packed);
+					}
+				}
+			}
+		}
 
 		/*
 		 * h16 blacklist decision: if the inner loop exited via
@@ -2073,6 +2320,20 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 						 h16_equal_func,
 						 free, NULL);
 	st.h16_blacklist_skipped = 0;
+	/*
+	 * Skip-caches (Fixes A and B). phys_saturated and capskip_cand use
+	 * direct (integer-in-pointer) keys with no allocation and no destroy
+	 * func. h16_cursor owns malloc'd 16-byte h16 keys (freed on destroy /
+	 * clear) and stores a packed (fileid,loff) pointer as the value (no
+	 * value destroy). See lookup_dedupe_internal.h for the invariants.
+	 */
+	st.phys_saturated = g_hash_table_new(g_direct_hash, g_direct_equal);
+	st.capskip_cand = g_hash_table_new(g_direct_hash, g_direct_equal);
+	st.h16_cursor = g_hash_table_new_full(h16_hash_func, h16_equal_func,
+					      free, NULL);
+	st.phys_cache_skipped = 0;
+	st.cand_cache_skipped = 0;
+	st.cursor_applied = 0;
 	st.zero_bytes_skipped = 0;
 	st.files_visited = 0;
 	st.total_files_in_walk = 0;
@@ -2101,8 +2362,19 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	 * candidate is already known to be a valid 16 KB match and
 	 * no wasted extend_match cycles happen.
 	 */
+	/*
+	 * Fix A cursor: the (fileid, loff) > (?2, ?3) row-value bound lets a
+	 * seed resume just past the contiguous leading run of cap_skipped
+	 * candidates recorded for this h16, turning a re-scan of millions of
+	 * saturated candidates into an index seek. SQLite optimizes the
+	 * row-value comparison against the covering idx_blocks_h16(h16,
+	 * fileid, loff) into a seek+scan. With no cursor we bind (0, 0); all
+	 * blocks_h16 fileids are >= 1 so that returns the full candidate list
+	 * (identity behavior).
+	 */
 	rc = sqlite3_prepare_v2(db->db,
-		"select fileid, loff from blocks_h16 where h16 = ?1;",
+		"select fileid, loff from blocks_h16 where h16 = ?1 "
+		"and (fileid, loff) > (?2, ?3);",
 		-1, &st.find_block_stmt, NULL);
 	if (rc) {
 		eprintf("lookup: preparing h16-lookup statement: %s\n",
@@ -2277,6 +2549,12 @@ int lookup_dedupe_main(struct dbhandle *db, int argc, char **argv,
 	sqlite3_finalize(st.bulk_set_alias_root_stmt);
 	if (st.h16_blacklist)
 		g_hash_table_destroy(st.h16_blacklist);
+	if (st.phys_saturated)
+		g_hash_table_destroy(st.phys_saturated);
+	if (st.capskip_cand)
+		g_hash_table_destroy(st.capskip_cand);
+	if (st.h16_cursor)
+		g_hash_table_destroy(st.h16_cursor);
 	coalesce_map_destroy();
 
 	qprintf("lookup: %"PRIu64" lookup file(s) processed, "

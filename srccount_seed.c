@@ -82,7 +82,7 @@
  *
  * Returns 0 and writes *out_phys on success, errno on failure.
  */
-static int fiemap_physical_addr(int fd, uint64_t loff, uint64_t *out_phys)
+int fiemap_physical_addr(int fd, uint64_t loff, uint64_t *out_phys)
 {
 	struct {
 		struct fiemap fm;
@@ -140,6 +140,29 @@ int srccount_lazy_seed(struct lookup_state *st,
 	ret = fiemap_physical_addr(ref->fd, canon_loff, &phys);
 	if (ret)
 		return ret;
+
+	/*
+	 * Fix B: physical-extent saturation short-circuit. If this extent's
+	 * physical address is already known to be at/over the cap - from a
+	 * prior seed that returned >= cap, or a kernel full-DITTO - skip the
+	 * expensive LOGICAL_INO backref walk entirely and record srccount=cap
+	 * so the cheaper DB cap_skip path catches future encounters of this
+	 * exact canonical without re-reaching Phase 5.
+	 *
+	 * SPACE-SAFE (no lost dedupe): an extent at the reflink cap rejects
+	 * ANY further dedupe - the kernel enforces backref_limit per physical
+	 * extent on every submission - so a candidate whose source extent is
+	 * full would DITTO with zero bytes anyway. Skipping it loses nothing
+	 * the kernel would have allowed. Monotonic within a run (we only add
+	 * reflinks; nothing removes them), so a cached "full" never becomes
+	 * "has room" mid-run -> no false positive -> no missed dedupe.
+	 */
+	if (phys != 0 &&
+	    g_hash_table_contains(st->phys_saturated, GSIZE_TO_POINTER(phys))) {
+		st->phys_cache_skipped++;
+		count = (uint64_t)cap;
+		goto persist;
+	}
 
 	/*
 	 * Allocate a btrfs_data_container sized for (cap+10) (root,
@@ -275,6 +298,19 @@ int srccount_lazy_seed(struct lookup_state *st,
 			count = cap_bound;
 	}
 
+	/*
+	 * Fix B populate: this extent is at/over the cap, so remember its
+	 * physical address. Future candidates whose source resolves to the
+	 * same physical extent short-circuit the LOGICAL_INO walk above. Only
+	 * reached on the real-ioctl path (the cache-hit path jumps straight
+	 * to persist), so we never re-insert a key we just matched.
+	 */
+	if (phys != 0 && count >= (uint64_t)cap)
+		bounded_skipcache_insert(st->phys_saturated,
+					 GSIZE_TO_POINTER(phys),
+					 GINT_TO_POINTER(1), SKIPCACHE_PHYS_MAX);
+
+persist:
 	*out_srccount = (int64_t)count;
 
 	/* Persist to blocks.srccount so future encounters of this

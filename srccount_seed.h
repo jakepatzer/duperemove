@@ -40,4 +40,12 @@ int srccount_lazy_seed(struct lookup_state *st,
 		       int64_t canon_fileid, uint64_t canon_loff,
 		       uint32_t cap, int64_t *out_srccount);
 
+/*
+ * Resolve the physical (devid-relative) byte address of the extent
+ * containing (fd, loff) via a single FIEMAP ioctl. Returns 0 and writes
+ * *out_phys on success, errno on failure. Exposed for the Fix B
+ * physical-extent saturation cache populate path in lookup_dedupe.c.
+ */
+int fiemap_physical_addr(int fd, uint64_t loff, uint64_t *out_phys);
+
 #endif	/* __SRCCOUNT_SEED_H__ */

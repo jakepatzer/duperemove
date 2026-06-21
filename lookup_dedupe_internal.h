@@ -24,6 +24,30 @@
 
 struct dbhandle;
 
+/*
+ * Per-table entry ceilings for the in-memory skip-caches. These bound
+ * worst-case RSS: each entry is a pointer-sized key (+ ghashtable node
+ * overhead ~32-48 B); the cursor map additionally holds a 16-byte key
+ * alloc. ~16M + 16M + 4M entries is roughly 1.5-2 GB peak, comfortably
+ * inside the 24 GB box with the lookup baseline (~1.4 GB) and SQLite
+ * cache (256 MB). When a table hits its ceiling it is cleared whole
+ * (bounded_skipcache_insert); see that function for why clearing is
+ * correctness-safe.
+ */
+#define SKIPCACHE_PHYS_MAX	((guint)16000000)
+#define SKIPCACHE_CAND_MAX	((guint)16000000)
+#define SKIPCACHE_CURSOR_MAX	((guint)4000000)
+
+/*
+ * Bounded insert: if the table is at or above cap, clear it entirely
+ * (respecting its key/value destroy funcs) before inserting. Clearing
+ * is safe because every skip-cache only ever stores "known saturated"
+ * facts that are re-derivable on the next encounter; dropping them costs
+ * a re-lookup/re-seed, never correctness. Defined in lookup_dedupe.c.
+ */
+void bounded_skipcache_insert(GHashTable *t, gpointer key, gpointer val,
+			      guint cap);
+
 struct lookup_state {
 	struct dbhandle	*db;
 	sqlite3_stmt	*find_block_stmt;
@@ -121,6 +145,52 @@ struct lookup_state {
 	 */
 	GHashTable	*h16_blacklist;
 	uint64_t	h16_blacklist_skipped;
+
+	/*
+	 * Skip-caches (Fixes A and B). All three are in-memory only,
+	 * hard-bounded (clear-on-full eviction via bounded_skipcache_insert),
+	 * and PURELY a performance layer over read-side skip decisions: none
+	 * of them writes srccount/alias_root or changes which dedupes happen.
+	 * Eviction is correctness-safe - a dropped entry just causes a
+	 * re-lookup/re-seed, never a wrong decision. All rely on the same
+	 * within-run monotonicity that the h16_blacklist relies on: a
+	 * canonical/extent that reached the cap never drops back below it
+	 * during a run (we only add reflinks; nothing removes them), and
+	 * blocks_h16 is static during a lookup run.
+	 *
+	 * phys_saturated (Fix B): set of physical extent byte-addresses
+	 * known to be at/over the reflink cap. Populated when a Phase-5
+	 * LOGICAL_INO seed returns >= cap, and when the kernel returns a
+	 * full DITTO (extent at backref_limit). Checked inside
+	 * srccount_lazy_seed (reusing its FIEMAP) to short-circuit the
+	 * expensive LOGICAL_INO walk for candidates whose source extent is
+	 * already known full. Keyed by the physical address as a direct
+	 * pointer (g_direct_hash); no key allocation. This attacks the
+	 * per-fresh-canonical seed+DITTO storm seen on heavily-shared images.
+	 *
+	 * capskip_cand (Fix A, part 1): set of candidate (fileid, loff)
+	 * positions that previously cap_skipped. Checked before
+	 * resolve_canonical to skip the per-candidate SQL point-lookup for
+	 * known-saturated candidates. Key is (fileid, loff) bit-packed into
+	 * a single pointer (see skipcache_pack_key); entries whose values do
+	 * not fit the packing are simply not cached (safe).
+	 *
+	 * h16_cursor (Fix A, part 2): per-h16 high-water mark. Maps a
+	 * 16-byte h16 to the (fileid, loff) of the end of its contiguous
+	 * leading run of cap_skipped candidates. The find_block query resumes
+	 * just past this point, so successive seeds of the same hot h16 do
+	 * not re-scan a saturated prefix (and a seed that bailed at
+	 * MAX_CAND_PER_SEED resumes where it stopped instead of restarting at
+	 * 0). The mark only ever advances (monotonic), so a stored value is
+	 * always valid. Key is a malloc'd 16-byte h16; value is a packed
+	 * (fileid, loff) pointer.
+	 */
+	GHashTable	*phys_saturated;
+	GHashTable	*capskip_cand;
+	GHashTable	*h16_cursor;
+	uint64_t	phys_cache_skipped;	/* Fix B short-circuits */
+	uint64_t	cand_cache_skipped;	/* Fix A cap-skip-cache hits */
+	uint64_t	cursor_applied;		/* seeds that resumed past a cursor */
 
 	/*
 	 * Bytes skipped by --skip-zeroes. Each time the leading
